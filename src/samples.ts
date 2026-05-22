@@ -35,11 +35,11 @@ const GB = 1024 * 1024 * 1024;
 export const SAMPLE_PRESETS: readonly SamplePreset[] = [
   {
     id: 'sample-2gb',
-    label: 'Sample — 2 GB',
-    sizeBytes: 2 * GB,
-    fileCount: 2000,
-    url: 'https://REPLACE-ME.r2.dev/samples/rangezip-sample-2gb.zip',
-    available: false,
+    label: 'Sample — 2 GB (images · video · docs · text)',
+    sizeBytes: 1951670880,
+    fileCount: 510,
+    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-2gb.zip',
+    available: true,
   },
   {
     id: 'sample-10gb',
