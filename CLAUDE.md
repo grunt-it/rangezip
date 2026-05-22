@@ -49,7 +49,10 @@ module has a co-located unit test, no runtime needed:
 - `src/auth/session.ts` — HMAC-SHA256 session sign/verify, base64url, constant-
   time compare. Uses only WebCrypto (`crypto.subtle`) + `TextEncoder`, so it's
   testable without HTTP. `test/auth.test.ts`.
-- `src/auth/codes.ts` — access-code parsing + constant-time matching.
+- `src/registry/codes.ts` — access-code generation (CSPRNG + rejection sampling
+  over a URL-safe, unambiguous alphabet) and the usage-aggregation reducer
+  (`aggregateUsage`, folding a code's events into the admin summary). Pure; the
+  `Registry` DO shell calls these. `test/registry-codes.test.ts`.
 - `src/metrics.ts` — the metrics aggregation/labelling math (totals, the
   headline percentage, bytes-saved). `test/metrics.test.ts`.
 - `src/progress.ts` — WebSocket message types + `overallPercent`.
@@ -130,6 +133,47 @@ webSocket: client })`. Progress is broadcast to `ctx.getWebSockets()`. The
   is NEVER written to SQLite, logged, or returned — it's dropped in `runJob`'s
   `finally`. Metrics are persisted to `metrics_json` so `report()` survives
   eviction; `currentMetrics()` prefers the live sink, falls back to the column.
+- **Usage events flow to the Registry.** `runJob` records `job_started` and
+  `job_completed` against the session's `code` via `recordUsage`, which calls the
+  singleton `Registry` DO. It's **best-effort**: failures are swallowed so a
+  Registry hiccup never disrupts or fails an extraction, and it's a no-op when
+  the job carries no code. The completion detail uses REAL metrics the run
+  already measured (`filesExtracted`, `rangeBytesFetched`, `rangeBytesPercent`)
+  plus wallclock `durationMs` — don't fabricate numbers here either.
+
+## Durable Object — `src/registry/registry.ts` (the `Registry`)
+
+- **A singleton** addressed by `getByName("registry")` (constant `REGISTRY_NAME`)
+  — exactly ONE instance holds all access codes + usage events. Same DO+SQLite
+  pattern as `ExtractJob` (no D1). Schema (`codes`, `usage_events`) is created in
+  the constructor via `blockConcurrencyWhile`.
+- **The source of truth for access codes** — there is NO static `ACCESS_CODES`
+  secret anymore. `/auth` calls `validateCode` (active + not revoked); the admin
+  panel calls `createCode` / `listCodes` / `revokeCode` / `codeTimeline`.
+- **RPC shell is thin.** The fiddly bits — random code generation and the
+  usage-aggregation fold — are pure functions in `src/registry/codes.ts`; the DO
+  just runs SQL and calls them. When adding a new aggregate or event type, put
+  the logic in `codes.ts` with a unit test, not inline in the DO.
+- **New SQLite class → new migration tag.** Unlike `ExtractJob`'s column-adds
+  (which reuse `v1`), a brand-new DO class needs its own migration: `v2` with
+  `new_sqlite_classes: ["Registry"]`, **appended** to the migrations array — never
+  edit the `v1` `ExtractJob` migration.
+
+## Access-code + admin auth — `src/auth/`
+
+- **Two distinct sessions, one HMAC key (`SESSION_SECRET`).** Both are the same
+  signed `<payload>.<hmac>` token from `session.ts`, distinguished by cookie name
+  AND a `sub` sentinel:
+  - access-code session → cookie `rangezip_session`, `sub` = the access code.
+  - admin session → cookie `rangezip_admin`, `sub` = `"admin"` (`ADMIN_SUBJECT`).
+- **Mutually exclusive.** `requireSession` reads only `rangezip_session` and
+  rejects the `admin` sub; `requireAdmin` reads only `rangezip_admin` and
+  requires the `admin` sub. An admin cookie can't satisfy a code-gated route and
+  vice versa — enforced at both the cookie-name and sub layers.
+- **`ADMIN_KEY`** (secret) gates `/admin/*`. `POST /admin/auth` constant-time-
+  compares the submitted key (`timingSafeEqual`) and issues the admin cookie.
+- The session `sub` being the code is what lets `sessionCode()` attribute
+  `/extract` jobs back to the code that signed in.
 
 ## Metrics honesty
 

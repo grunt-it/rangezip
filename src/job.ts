@@ -36,11 +36,15 @@ import { makeByoBucket, type ByoConfig } from './destination';
 import { Layer, ManagedRuntime } from 'effect';
 import { makeHttpSource } from './effect/services';
 import { overallPercent, type ProgressMessage } from './progress';
+import { EVENT_TYPES } from './registry/codes';
+import { REGISTRY_NAME, type Registry } from './registry/registry';
 import type { ZipEntry } from './zip';
 
 /** Bindings the DO needs. Mirrors the Worker `Env`. */
 export interface JobEnv {
   OUTPUT: R2Bucket;
+  /** Singleton registry — for recording per-code usage events. */
+  REGISTRY: DurableObjectNamespace<Registry>;
   EXTRACT_TTL_HOURS?: string;
 }
 
@@ -87,6 +91,10 @@ export interface StartInput {
   readonly files?: string[];
   readonly destination: Destination;
   readonly byo?: ByoConfig;
+  /** Access code that started the session — for usage attribution. */
+  readonly code?: string;
+  /** Source label ("url" or a sample id) for the job_started event detail. */
+  readonly sourceLabel?: string;
 }
 
 interface JobRow extends Record<string, SqlStorageValue> {
@@ -322,6 +330,7 @@ export class ExtractJob extends DurableObject<JobEnv> {
 
   private async runJob(input: StartInput): Promise<void> {
     const rt = this.createRuntime(input.sourceUrl);
+    const startedAt = Date.now();
     try {
       this.setJobStatus('running');
       await this.broadcastSnapshot();
@@ -332,6 +341,12 @@ export class ExtractJob extends DurableObject<JobEnv> {
       this.metrics.setIndexReadMs(performance.now() - indexStart);
 
       const selected = selectEntries(entries, input.files);
+
+      // Attribute job start to the session's code (real requested-file count).
+      await this.recordUsage(input.code, EVENT_TYPES.jobStarted, {
+        source: input.sourceLabel ?? 'url',
+        requestedFiles: input.files === undefined ? selected.length : input.files.length,
+      });
 
       // Seed the file table with everything we intend to extract.
       for (const entry of selected) {
@@ -355,6 +370,16 @@ export class ExtractJob extends DurableObject<JobEnv> {
       // recorded individually and do not fail the whole job.
       this.setJobStatus('completed');
       await this.scheduleCleanupIfDemo(input.destination, input.prefix);
+
+      // Attribute completion with REAL metrics the run already measured.
+      const m = deriveMetrics(this.metrics.snapshot());
+      await this.recordUsage(input.code, EVENT_TYPES.jobCompleted, {
+        filesExtracted: m.filesExtracted,
+        bytes: m.rangeBytesFetched,
+        percentOfArchive: m.rangeBytesPercent,
+        durationMs: Date.now() - startedAt,
+      });
+
       await this.broadcastDone('completed');
     } catch (err) {
       this.recordJobError(err);
@@ -364,6 +389,25 @@ export class ExtractJob extends DurableObject<JobEnv> {
       // Drop transient BYO credentials the moment the run ends.
       this.byoConfig = null;
       await rt.dispose();
+    }
+  }
+
+  /**
+   * Record a usage event against the session's code via the singleton Registry.
+   * Best-effort and isolated: a Registry hiccup must never fail or stall the
+   * extraction, so failures are swallowed (the event is just lost). No-op when
+   * the job carries no code (e.g. direct API use without a code-bound session).
+   */
+  private async recordUsage(
+    code: string | undefined,
+    type: string,
+    detail: Record<string, unknown>,
+  ): Promise<void> {
+    if (!code) return;
+    try {
+      await this.env.REGISTRY.getByName(REGISTRY_NAME).recordEvent(code, type, detail);
+    } catch {
+      // Usage tracking is non-critical; never let it disrupt the job.
     }
   }
 

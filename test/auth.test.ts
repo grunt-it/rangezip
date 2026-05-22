@@ -14,7 +14,6 @@ import {
   timingSafeEqual,
   verifySession,
 } from '../src/auth/session';
-import { isValidAccessCode, parseAccessCodes } from '../src/auth/codes';
 
 const SECRET = 'test-session-secret-please-rotate';
 
@@ -102,32 +101,14 @@ describe('signSession / verifySession', () => {
   });
 });
 
-describe('parseAccessCodes', () => {
-  it('splits, trims, and drops empties', () => {
-    expect(parseAccessCodes(' a , b ,,c , ')).toEqual(['a', 'b', 'c']);
-  });
-  it('returns [] for undefined or empty', () => {
-    expect(parseAccessCodes(undefined)).toEqual([]);
-    expect(parseAccessCodes('')).toEqual([]);
-    expect(parseAccessCodes('  ,  ')).toEqual([]);
-  });
-});
-
-describe('isValidAccessCode', () => {
-  const codes = parseAccessCodes('alpha, bravo, charlie');
-  it('accepts a configured code (trimmed)', () => {
-    expect(isValidAccessCode('bravo', codes)).toBe(true);
-    expect(isValidAccessCode('  bravo  ', codes)).toBe(true);
-  });
-  it('rejects an unknown code', () => {
-    expect(isValidAccessCode('delta', codes)).toBe(false);
-  });
-  it('rejects empty submission or empty config', () => {
-    expect(isValidAccessCode('', codes)).toBe(false);
-    expect(isValidAccessCode('   ', codes)).toBe(false);
-    expect(isValidAccessCode('alpha', [])).toBe(false);
-  });
-  it('is case-sensitive (exact match only)', () => {
-    expect(isValidAccessCode('ALPHA', codes)).toBe(false);
+describe('admin session distinction', () => {
+  it('an admin-sub token differs from a code-sub token under the same secret', async () => {
+    const adminTok = await signSession(SECRET, { sub: 'admin', now: 1000 });
+    const codeTok = await signSession(SECRET, { sub: 'somecode', now: 1000 });
+    expect(adminTok).not.toBe(codeTok);
+    const admin = await verifySession(SECRET, adminTok, 2000);
+    const code = await verifySession(SECRET, codeTok, 2000);
+    expect(admin.ok && admin.payload.sub).toBe('admin');
+    expect(code.ok && code.payload.sub).toBe('somecode');
   });
 });

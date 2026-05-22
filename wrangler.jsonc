@@ -8,7 +8,7 @@
   "observability": {
     "enabled": true,
   },
-  // Non-secret vars. Secrets (ACCESS_CODES, SESSION_SECRET) are set out-of-band
+  // Non-secret vars. Secrets (SESSION_SECRET, ADMIN_KEY) are set out-of-band
   // via `wrangler secret put` — never committed here. See README "Auth setup".
   "vars": {
     // Demo-bucket output is auto-deleted this many hours after a job completes.
@@ -20,12 +20,22 @@
         "name": "EXTRACT_JOB",
         "class_name": "ExtractJob",
       },
+      // Singleton registry of access codes + usage events (idFromName "registry").
+      {
+        "name": "REGISTRY",
+        "class_name": "Registry",
+      },
     ],
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["ExtractJob"],
+    },
+    {
+      // v2 introduces the Registry SQLite class — append-only, never edit v1.
+      "tag": "v2",
+      "new_sqlite_classes": ["Registry"],
     },
   ],
   "r2_buckets": [

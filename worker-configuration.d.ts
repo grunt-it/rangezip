@@ -11,10 +11,12 @@
 interface RangezipEnv {
   OUTPUT: R2Bucket;
   EXTRACT_JOB: DurableObjectNamespace<import('./src/worker').ExtractJob>;
-  /** Comma-separated list of multi-use access codes (secret). */
-  ACCESS_CODES?: string;
-  /** HMAC key for signing session cookies (secret). */
+  /** Singleton registry of access codes + usage events (addressed by name). */
+  REGISTRY: DurableObjectNamespace<import('./src/worker').Registry>;
+  /** HMAC key for signing session cookies, both code + admin (secret). */
   SESSION_SECRET?: string;
+  /** Admin-panel key gating `/admin/*` (secret). */
+  ADMIN_KEY?: string;
   /** Demo-bucket cleanup TTL in hours (var, default 2). */
   EXTRACT_TTL_HOURS?: string;
 }

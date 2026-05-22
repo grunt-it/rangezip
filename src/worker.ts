@@ -6,6 +6,7 @@
 import { createApp, type Env } from './app';
 
 export { ExtractJob } from './job';
+export { Registry } from './registry/registry';
 
 const app = createApp();
 

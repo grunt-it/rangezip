@@ -27,25 +27,41 @@ import { readIndex } from './extract';
 import { makeRuntime, runSafe, toResponse, type Services } from './effect/runtime';
 import { EntryNotFoundError, type AppError } from './effect/errors';
 import {
+  adminCookie,
+  clearAdminCookie,
   clearSessionCookie,
   hasValidSession,
+  requireAdmin,
   requireSession,
+  sessionCode,
   sessionCookie,
+  ADMIN_SUBJECT,
   type AuthEnv,
 } from './auth/middleware';
-import { isValidAccessCode, parseAccessCodes } from './auth/codes';
-import { DEFAULT_SESSION_TTL_MS, signSession } from './auth/session';
+import { DEFAULT_SESSION_TTL_MS, signSession, timingSafeEqual } from './auth/session';
+import { EVENT_TYPES } from './registry/codes';
+import { REGISTRY_NAME, type Registry } from './registry/registry';
 import { parseByoConfig, validateDestination, type ByoConfig } from './destination';
 import { renderDemoPage } from './ui';
+import { renderAdminPage } from './admin-ui';
+import { SAMPLE_PRESETS } from './samples';
 import { Effect } from 'effect';
 import type { Destination, ExtractJob } from './job';
 import type { ZipEntry } from './zip';
 
 export interface Env extends AuthEnv {
   EXTRACT_JOB: DurableObjectNamespace<ExtractJob>;
+  REGISTRY: DurableObjectNamespace<Registry>;
   OUTPUT: R2Bucket;
   EXTRACT_TTL_HOURS?: string;
 }
+
+/** Resolve the singleton Registry stub (always addressed by the same name). */
+function registry(env: Env): DurableObjectStub<Registry> {
+  return env.REGISTRY.getByName(REGISTRY_NAME);
+}
+
+const encoder = new TextEncoder();
 
 interface ExtractBody {
   sourceUrl?: unknown;
@@ -74,19 +90,19 @@ export function createApp() {
     const body = await readJson(c.req.raw);
     const code =
       body && typeof (body as { code?: unknown }).code === 'string'
-        ? (body as { code: string }).code
+        ? (body as { code: string }).code.trim()
         : '';
-    const configured = parseAccessCodes(c.env.ACCESS_CODES);
-    if (configured.length === 0) {
-      return c.json(
-        { error: { tag: 'Unconfigured', message: 'ACCESS_CODES is not configured' } },
-        500,
-      );
-    }
-    if (!isValidAccessCode(code, configured)) {
+
+    // The Registry DO is the source of truth — validate against it (not a static
+    // secret). On success the session `sub` IS the code, so all downstream
+    // activity attributes to it.
+    const result = await registry(c.env).validateCode(code);
+    if (!result.ok) {
       return c.json({ error: { tag: 'Unauthorized', message: 'Invalid access code' } }, 401);
     }
-    const token = await signSession(c.env.SESSION_SECRET);
+    await registry(c.env).recordEvent(code, EVENT_TYPES.sessionStart, {});
+
+    const token = await signSession(c.env.SESSION_SECRET, { sub: code });
     c.header('Set-Cookie', sessionCookie(token, Math.floor(DEFAULT_SESSION_TTL_MS / 1000)));
     return c.json({ ok: true });
   });
@@ -99,6 +115,75 @@ export function createApp() {
   app.get('/me', async (c) => {
     const ok = await hasValidSession(c.req.raw, c.env.SESSION_SECRET);
     return ok ? c.json({ ok: true }) : c.json({ error: { tag: 'Unauthorized' } }, 401);
+  });
+
+  // ---- admin ----
+
+  // The admin panel HTML. Public route (gated client-side by the key form);
+  // every DATA route below is server-gated by `requireAdmin`.
+  app.get('/admin', (c) => c.html(renderAdminPage()));
+
+  // Exchange the ADMIN_KEY for a separate admin session cookie. Constant-time
+  // compare so the time taken doesn't leak how much of the key matched.
+  app.post('/admin/auth', async (c) => {
+    if (!c.env.SESSION_SECRET) {
+      return c.json(
+        { error: { tag: 'Unconfigured', message: 'SESSION_SECRET is not configured' } },
+        500,
+      );
+    }
+    if (!c.env.ADMIN_KEY) {
+      return c.json(
+        { error: { tag: 'Unconfigured', message: 'ADMIN_KEY is not configured' } },
+        500,
+      );
+    }
+    const body = await readJson(c.req.raw);
+    const key =
+      body && typeof (body as { key?: unknown }).key === 'string'
+        ? (body as { key: string }).key
+        : '';
+    if (!timingSafeEqual(encoder.encode(key), encoder.encode(c.env.ADMIN_KEY))) {
+      return c.json({ error: { tag: 'Unauthorized', message: 'Invalid admin key' } }, 401);
+    }
+    const token = await signSession(c.env.SESSION_SECRET, { sub: ADMIN_SUBJECT });
+    c.header('Set-Cookie', adminCookie(token, Math.floor(DEFAULT_SESSION_TTL_MS / 1000)));
+    return c.json({ ok: true });
+  });
+
+  app.post('/admin/logout', (c) => {
+    c.header('Set-Cookie', clearAdminCookie());
+    return c.json({ ok: true });
+  });
+
+  app.get('/admin/codes', requireAdmin(), async (c) => {
+    const codes = await registry(c.env).listCodes();
+    return c.json({ codes });
+  });
+
+  app.post('/admin/codes', requireAdmin(), async (c) => {
+    const body = await readJson(c.req.raw);
+    const label =
+      body && typeof (body as { label?: unknown }).label === 'string'
+        ? (body as { label: string }).label
+        : '';
+    const created = await registry(c.env).createCode(label);
+    return c.json(created, 201);
+  });
+
+  app.post('/admin/codes/:code/revoke', requireAdmin(), async (c) => {
+    const code = c.req.param('code');
+    const result = await registry(c.env).revokeCode(code);
+    if (!result.ok) {
+      return c.json({ error: { tag: 'CodeNotFound', message: `No code "${code}"` } }, 404);
+    }
+    return c.json({ ok: true });
+  });
+
+  app.get('/admin/codes/:code/timeline', requireAdmin(), async (c) => {
+    const code = c.req.param('code');
+    const events = await registry(c.env).codeTimeline(code);
+    return c.json({ code, events });
   });
 
   // ---- gated ----
@@ -121,6 +206,12 @@ export function createApp() {
       await rt.dispose();
     }
 
+    // Attribute the job to the code that started this session, and label the
+    // source as a known sample id or the generic "url". Both flow into the DO so
+    // it can record job_started / job_completed events against the code.
+    const code = await sessionCode(c.req.raw, c.env.SESSION_SECRET);
+    const sourceLabel = labelForSource(sourceUrl);
+
     const jobId = crypto.randomUUID();
     const stub = c.env.EXTRACT_JOB.getByName(jobId);
     const { status } = await stub.start({
@@ -130,6 +221,8 @@ export function createApp() {
       files,
       destination,
       byo,
+      code: code ?? undefined,
+      sourceLabel,
     });
 
     return c.json({ jobId, status }, 202);
@@ -319,6 +412,16 @@ export function parseExtractBody(body: ExtractBody | null): ParsedBody {
       byo,
     },
   };
+}
+
+/**
+ * Label a source URL for usage attribution: the matching sample's id if the URL
+ * is one of the built-in presets, otherwise the generic "url". Pure lookup over
+ * the static preset list — no IO.
+ */
+export function labelForSource(sourceUrl: string): string {
+  const sample = SAMPLE_PRESETS.find((s) => s.url === sourceUrl);
+  return sample ? sample.id : 'url';
 }
 
 function isHttpUrl(value: string): boolean {

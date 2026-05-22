@@ -108,29 +108,64 @@ with downloads, and a countdown to cleanup.
 ### Auth setup (required before deploy)
 
 Auth is an access-code gate that issues a signed (HMAC-SHA256) session cookie.
-**No secrets are hardcoded** — set them with `wrangler secret put`:
+Access codes are **not** a static secret — they live in a SQLite-backed
+`Registry` Durable Object and are created/labelled/revoked from the admin panel
+(see below). The only secrets are the HMAC key and the admin key:
 
 ```sh
-# Comma-separated list of multi-use access codes. Anyone with a code gets in.
-wrangler secret put ACCESS_CODES        # e.g. "team-demo-2026, investor-xyz"
-
-# HMAC key for signing session cookies. Use a long random string.
+# HMAC key for signing BOTH session cookies (access-code + admin). Long + random.
 wrangler secret put SESSION_SECRET      # e.g. `openssl rand -hex 32`
+
+# Admin-panel key — gates /admin and the code-management API. Long + random.
+wrangler secret put ADMIN_KEY           # e.g. `openssl rand -hex 32`
 ```
+
+(There is no longer an `ACCESS_CODES` secret — the Registry is the source of
+truth. If you're upgrading an older deploy, you can drop it.)
 
 For local `wrangler dev`, put them in a gitignored `.dev.vars` file:
 
 ```ini
-ACCESS_CODES=demo123, friend456
 SESSION_SECRET=local-dev-only-not-a-real-secret
+ADMIN_KEY=local-dev-only-admin-key
 ```
 
-`POST /auth { code }` verifies the code against `ACCESS_CODES` and, on success,
-sets `rangezip_session` — an `HttpOnly; Secure; SameSite=Lax; Max-Age=86400`
-cookie carrying `<base64url(payload)>.<base64url(hmac)>`. The middleware on the
+**The access-code model.** `POST /auth { code }` calls
+`Registry.validateCode(code)` — a code is accepted iff it exists and hasn't been
+revoked. On success it records a `session_start` usage event and sets
+`rangezip_session`, an `HttpOnly; Secure; SameSite=Lax; Max-Age=86400` cookie
+carrying `<base64url(payload)>.<base64url(hmac)>` whose `sub` **is the access
+code** (so all downstream activity attributes to it). The middleware on the
 gated routes recomputes the HMAC (constant-time) and checks expiry; there's no
 server-side session store. `POST /logout` clears it; `GET /me` reports whether a
 valid session is present.
+
+### Admin panel — `/admin`
+
+A separate self-contained page (same dark theme + logo) for managing access
+codes and reviewing usage. It's gated by `ADMIN_KEY`, **not** an access-code
+session: `POST /admin/auth { key }` constant-time-compares the key and issues a
+distinct admin cookie (`rangezip_admin`, `sub = "admin"`). The two cookies are
+mutually exclusive — an admin session can't satisfy a code-gated route and vice
+versa (different cookie name + a `sub` sentinel check). All `/admin/*` data
+routes require the admin session.
+
+From the panel you can:
+
+- **Generate** a code with a label (e.g. "Investor demo — Acme"); the new code
+  is shown to copy.
+- See a **code list**: label · code · created · redeemed? · last active ·
+  #sessions · #jobs · #files · bytes — all aggregated from real usage events.
+- **Revoke** a code (it can no longer sign in; existing sessions expire on TTL).
+- Open a per-code **usage timeline** of every recorded event.
+
+**Usage tracking.** Codes accrue events in the Registry: `session_start` on
+sign-in, plus `job_started` (`{ source, requestedFiles }`) and `job_completed`
+(`{ filesExtracted, bytes, percentOfArchive, durationMs }`) emitted by the
+extraction job, attributed to the session's code. The job records these
+best-effort — a Registry hiccup never disrupts an extraction. Every number in
+the admin view is a real measurement the job already computes (same honesty bar
+as the demo metrics).
 
 ### Honest metrics
 
@@ -399,6 +434,14 @@ Being honest about where this technique shines and where it doesn't:
   progress bursts) and the cleanup **alarm** (one alarm per DO, deleting the
   demo-bucket output at the TTL).
 
+- **A singleton `Registry` Durable Object** (`src/registry/registry.ts`,
+  addressed by `getByName("registry")`) is the source of truth for access codes
+  and usage events — same DO+SQLite pattern (no D1). Its pure bits — random
+  code generation and the usage-aggregation reducer — live in
+  `src/registry/codes.ts` with their own unit tests, per the pure-logic-vs-shell
+  split. The wrangler `v2` migration introduces this SQLite class (the `v1`
+  `ExtractJob` migration is untouched).
+
 ## Extension: sources that DON'T support range requests
 
 rangezip requires the source to honour HTTP range requests (it checks, and
@@ -423,12 +466,14 @@ source, while keeping the memory-bounded extraction core identical.
 bun install
 bun run typecheck   # tsc --noEmit (strict + noUncheckedIndexedAccess + verbatimModuleSyntax)
 bun run test        # vitest, inside the real Workers runtime via @cloudflare/vitest-pool-workers
-bun run dev         # wrangler dev (put ACCESS_CODES + SESSION_SECRET in .dev.vars first)
+bun run dev         # wrangler dev (put SESSION_SECRET + ADMIN_KEY in .dev.vars first)
 bun run deploy      # wrangler deploy (create the R2 bucket + set secrets first)
 ```
 
 Before `dev`/`deploy`, set the auth secrets (see "Auth setup" above): a
-gitignored `.dev.vars` for local dev, `wrangler secret put` for deploy.
+gitignored `.dev.vars` for local dev, `wrangler secret put` for deploy. After
+deploy, open `/admin`, sign in with `ADMIN_KEY`, and generate the first access
+code — there are no codes until you make one.
 
 Tests build **real** ZIP fixtures in-memory with `fflate` and assert the
 central-directory parse, the local-header data-offset computation, and a full
