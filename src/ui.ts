@@ -217,18 +217,18 @@ const PAGE = String.raw`<!doctype html>
     <section class="panel">
       <h2>1 — Source archive</h2>
       <div class="seg" id="sourceSeg">
-        <button data-src="url" class="active">Paste a ZIP URL</button>
-        <button data-src="sample">Use a sample</button>
+        <button data-src="sample" class="active">Use a sample</button>
+        <button data-src="url">Paste a ZIP URL</button>
       </div>
-      <div id="srcUrl" class="mt">
-        <label for="zipUrl">ZIP URL (must support HTTP range requests)</label>
-        <input id="zipUrl" type="text" placeholder="https://example.com/huge.zip" />
-        <p class="hint">Extraction speed depends on how fast the source server answers byte-range requests — a slow or non-CDN host is the bottleneck, not rangezip.</p>
-      </div>
-      <div id="srcSample" class="mt hidden">
+      <div id="srcSample" class="mt">
         <label for="sampleSel">Sample archive</label>
         <select id="sampleSel"></select>
         <p class="hint" id="sampleHint"></p>
+      </div>
+      <div id="srcUrl" class="mt hidden">
+        <label for="zipUrl">ZIP URL (must support HTTP range requests)</label>
+        <input id="zipUrl" type="text" placeholder="https://example.com/huge.zip" />
+        <p class="hint">Extraction speed depends on how fast the source server answers byte-range requests. A slow or non-CDN host is the bottleneck, not rangezip.</p>
       </div>
     </section>
 
@@ -402,7 +402,7 @@ function storedJobId() {
 }
 
 // ---- state ----
-let sourceMode = 'url';
+let sourceMode = 'sample';
 let destMode = 'demo';
 let byoValidated = false;
 let currentJob = null;
