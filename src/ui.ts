@@ -168,6 +168,7 @@ const PAGE = String.raw`<!doctype html>
       <div id="srcUrl" class="mt">
         <label for="zipUrl">ZIP URL (must support HTTP range requests)</label>
         <input id="zipUrl" type="text" placeholder="https://example.com/huge.zip" />
+        <p class="hint">Extraction speed depends on how fast the source server answers byte-range requests — a slow or non-CDN host is the bottleneck, not rangezip.</p>
       </div>
       <div id="srcSample" class="mt hidden">
         <label for="sampleSel">Sample archive</label>
@@ -206,6 +207,7 @@ const PAGE = String.raw`<!doctype html>
         </div>
         <p class="hint">Use a <strong>scoped, write-only key</strong> for just this bucket/prefix — not a root key.
           Your credentials are sent over HTTPS, held only in memory for the run, never stored or logged.</p>
+        <p class="hint">Write speed depends on your S3/R2 provider's throughput and region — that sets the pace for keeping the files, not rangezip.</p>
       </div>
     </section>
 
