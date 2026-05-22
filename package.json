@@ -1,0 +1,32 @@
+{
+  "name": "rangezip",
+  "version": "0.1.0",
+  "description": "Extract individual files from a huge remote ZIP on Cloudflare Workers using HTTP byte-range reads — without ever downloading the whole archive.",
+  "license": "MIT",
+  "author": "Nik Divjak",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "effect": "^3.21.2",
+    "hono": "^4.12.22"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.9",
+    "@cloudflare/workers-types": "^4.20260522.1",
+    "@types/node": "^25.9.1",
+    "fflate": "^0.8.3",
+    "prettier": "^3.8.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.7",
+    "wrangler": "^4.94.0"
+  }
+}

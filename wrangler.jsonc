@@ -1,0 +1,31 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rangezip",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-05-22",
+  // nodejs_compat is NOT required: we use the platform-native DecompressionStream
+  // and FixedLengthStream, not node:zlib. Kept minimal on purpose.
+  "observability": {
+    "enabled": true,
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "EXTRACT_JOB",
+        "class_name": "ExtractJob",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["ExtractJob"],
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "OUTPUT",
+      "bucket_name": "rangezip-output",
+    },
+  ],
+}

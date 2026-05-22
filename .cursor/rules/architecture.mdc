@@ -1,0 +1,89 @@
+---
+description: rangezip architecture — pure ZIP logic vs. Effect IO shell, memory discipline, Workers/DO/R2 conventions
+globs:
+alwaysApply: true
+---
+
+# rangezip architecture
+
+rangezip extracts individual files from a huge remote ZIP on Cloudflare Workers
+via HTTP byte-range reads, without downloading the whole archive. The defining
+constraint: a Worker isolate has a small memory ceiling, yet we handle multi-GB
+archives by never holding more than one byte-range slice in memory at a time.
+
+## Layering — keep these separate
+
+### Pure logic (`src/zip/`)
+
+ZIP-format parsing as pure functions over `Uint8Array`. No network, no R2, no
+Effect, no `fetch`. Inputs are byte slices; outputs are plain data or a
+discriminated `{ ok: true; … } | { ok: false; reason }`. Never `throw` for an
+expected parse failure — return `ok: false` and let the shell map it to a
+`ZipParseError`.
+
+- `byte-reader.ts` — little-endian reads + signature scan.
+- `format.ts` — signatures, methods, fixed sizes, parsed types.
+- `eocd.ts` — locate the central directory (classic EOCD + ZIP64).
+- `central-directory.ts` — parse entries (incl. ZIP64 extra-field promotion).
+- `local-header.ts` — compute the exact data offset from the 30-byte local
+  header (its name/extra lengths differ from the central directory's — this is
+  the subtle part).
+
+New ZIP-format handling goes here, as a pure function with a unit test. Not
+inline in an Effect, not in the DO.
+
+### Effect shell (`src/effect/`, `src/extract.ts`)
+
+IO and orchestration. Services are `Context.Tag`s provided as `Layer`s from
+`env` bindings:
+
+- `Source` — byte-range reads of the remote URL (`readRange` buffers small
+  headers; `streamRange` streams file data).
+- `Bucket` — the R2 binding.
+
+`src/extract.ts` glues pure parsers to services inside `Effect.gen`:
+`readIndex()` (tail → central dir → parse) and `extractEntry()` (local header →
+data range → decompress → R2).
+
+### Errors (`src/effect/errors.ts`)
+
+`class XError extends Data.TaggedError('XError')<ErrorParams>` with
+`ErrorParams = { message: string; status: number; cause?: unknown; [k]: unknown }`.
+The `status` is the HTTP status the API returns. No `try/catch` swallowing —
+failures are typed values in the Effect error channel. Errors:
+`RangeFetchError` 502, `ZipParseError` 422, `EntryNotFoundError` 404,
+`R2WriteError` 500, `DecompressError` 422.
+
+### Runtime (`src/effect/runtime.ts`)
+
+This is a Workers app, NOT SvelteKit. Build the runtime per-request / per-DO from
+`env` via `makeRuntime`. NEVER use `getRequestEvent` / `event.locals.runtime`.
+`run` throws on failure, `runSafe` returns a result union, `toResponse` renders a
+normalised error to a JSON `Response` with its HTTP status.
+
+## Memory discipline (non-negotiable)
+
+Never buffer a whole file or the whole archive. Index reads are small (tail +
+central directory). File data is always streamed:
+`Source.streamRange` → `DecompressionStream('deflate-raw')` (method 8) or
+pass-through (method 0) → `FixedLengthStream(uncompressedSize)` → `R2.put`. The
+`FixedLengthStream` gives R2 an exact `Content-Length` and turns a corrupt
+inflate into a write-time error. Don't call `.arrayBuffer()` on file data.
+
+## Durable Object (`src/job.ts`)
+
+One DO per job. SQLite schema in the constructor (`blockConcurrencyWhile`, init
+only). `start()` fires `runJob` fire-and-forget and returns the jobId
+immediately (the DO stays alive on pending I/O; `waitUntil` is a no-op in DOs).
+Bounded concurrency (6). Per-file failures are isolated in the `file` table; the
+job only `failed`s if extraction can't start. `createRuntime` is a `protected`
+test seam — no test-only branching in the hot path.
+
+## Stack rules
+
+- `bun`, not npm. TypeScript strict + `noUncheckedIndexedAccess` +
+  `verbatimModuleSyntax` (use `import type`). Prettier: single quotes, trailing
+  commas `all`, width 100, 2-space, semicolons.
+- `bun run typecheck` and `bun run test` must both pass.
+- Tests run in `workerd` via `@cloudflare/vitest-pool-workers`; fixtures are
+  real ZIPs built with `fflate`.
