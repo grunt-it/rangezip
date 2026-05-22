@@ -132,6 +132,58 @@ const PAGE = String.raw`<!doctype html>
   .ok { color: var(--accent-2); }
   .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
   .note { background: #0f1c2c; border: 1px solid #2c4a6a; border-radius: 10px; padding: 12px; font-size: 13px; }
+
+  /* Phase stepper — Reading index -> Extracting -> Done */
+  .phases { display: flex; align-items: stretch; gap: 0; margin: 2px 0 16px; }
+  .phase {
+    flex: 1; display: flex; flex-direction: column; gap: 4px; align-items: center;
+    padding: 10px 8px; background: var(--panel-2); border: 1px solid var(--line);
+    border-radius: 10px; text-align: center; position: relative; transition: all .2s;
+  }
+  .phase .ph-dot {
+    width: 22px; height: 22px; border-radius: 999px; border: 2px solid var(--line);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px; font-weight: 800; color: var(--muted); background: var(--bg);
+  }
+  .phase .ph-name { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: 0.03em; }
+  .phase .ph-sub { font-size: 10.5px; color: var(--muted); font-family: var(--mono); min-height: 13px; }
+  .phase .ph-time { font-size: 10.5px; color: var(--muted); font-family: var(--mono); min-height: 13px; }
+  .phase.active { border-color: var(--accent); background: #0f1c2c; }
+  .phase.active .ph-dot { border-color: var(--accent); color: var(--accent); }
+  .phase.active .ph-name { color: var(--text); }
+  .phase.active .ph-dot::after { content: ''; position: absolute; }
+  .phase.active .ph-dot { animation: phasepulse 1.4s ease-in-out infinite; }
+  .phase.done { border-color: #2c5a44; }
+  .phase.done .ph-dot { border-color: var(--accent-2); color: var(--accent-2); background: #0e1c17; }
+  .phase.done .ph-name { color: var(--accent-2); }
+  .ph-arrow { align-self: center; color: var(--muted); padding: 0 6px; font-size: 16px; flex: 0 0 auto; }
+  @keyframes phasepulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(79,157,255,0.45); }
+    50% { box-shadow: 0 0 0 5px rgba(79,157,255,0); }
+  }
+
+  /* Parallelism callout during extraction */
+  .parallel {
+    margin: 0 0 14px; padding: 12px 14px; border-radius: 10px;
+    background: #0f1c2c; border: 1px solid #2c4a6a;
+    display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+  }
+  .parallel .pv { font-family: var(--mono); font-size: 22px; font-weight: 800; color: var(--accent-2); }
+  .parallel .px { color: var(--muted); font-size: 13px; }
+  .parallel .pf { font-family: var(--mono); color: var(--text); }
+
+  /* Reconnect banner */
+  .reconnect {
+    margin-top: 12px; padding: 10px 12px; border-radius: 10px; font-size: 13px;
+    background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);
+    display: flex; align-items: center; gap: 8px;
+  }
+  .reconnect .spin {
+    width: 13px; height: 13px; border-radius: 999px; flex: 0 0 auto;
+    border: 2px solid var(--line); border-top-color: var(--accent);
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -158,6 +210,9 @@ const PAGE = String.raw`<!doctype html>
 
   <!-- MAIN -->
   <main id="main" class="hidden">
+    <!-- RECONNECT BANNER (shown while re-attaching to a stored job after reload) -->
+    <div id="reconnect" class="reconnect hidden"><span class="spin"></span><span id="reconnectMsg">Reconnecting to your job…</span></div>
+
     <!-- SOURCE -->
     <section class="panel">
       <h2>1 — Source archive</h2>
@@ -223,6 +278,38 @@ const PAGE = String.raw`<!doctype html>
     <!-- PROGRESS -->
     <section id="progressPanel" class="panel hidden">
       <h2>Progress <span id="jobPill" class="pill">pending</span></h2>
+
+      <!-- Phase stepper: Reading index -> Extracting -> Done -->
+      <div class="phases" id="phases">
+        <div class="phase" data-phase="reading-index">
+          <div class="ph-dot">1</div>
+          <div class="ph-name">Reading index</div>
+          <div class="ph-sub">sequential · 1×</div>
+          <div class="ph-time" id="phIndexTime"></div>
+        </div>
+        <div class="ph-arrow">→</div>
+        <div class="phase" data-phase="extracting">
+          <div class="ph-dot">2</div>
+          <div class="ph-name">Extracting</div>
+          <div class="ph-sub" id="phExtractConc">parallel</div>
+          <div class="ph-time" id="phExtractTime"></div>
+        </div>
+        <div class="ph-arrow">→</div>
+        <div class="phase" data-phase="done">
+          <div class="ph-dot">✓</div>
+          <div class="ph-name">Done</div>
+          <div class="ph-sub" id="phDoneSub"></div>
+          <div class="ph-time" id="phTotalTime"></div>
+        </div>
+      </div>
+
+      <!-- Cross-isolate parallelism callout (shown during/after extraction) -->
+      <div class="parallel hidden" id="parallel">
+        <span class="pv" id="pConcurrent">—</span>
+        <span class="px">peak concurrent extractions</span>
+        <span class="pf" id="pFormula"></span>
+      </div>
+
       <div class="bar"><i id="overallBar"></i></div>
       <p class="hint"><span id="overallPct">0%</span> · <span id="counts">0 / 0</span>
         <span id="cleanupWrap" class="hidden"> · clears in <span id="countdown" class="countdown">—</span></span></p>
@@ -292,6 +379,28 @@ async function api(path, opts) {
   return { status: res.status, ok: res.ok, body };
 }
 
+// ---- session persistence (survive a page reload) ----
+// The active jobId is stored both in localStorage and the URL hash so a reload
+// (or a shared link) re-attaches to the running/finished job instead of
+// clearing. WORKERS_PER_ISOLATE mirrors the DO's per-worker connection budget;
+// extraction concurrency is workerCount × this.
+const JOB_KEY = 'rangezip_job';
+const WORKERS_PER_ISOLATE = 6;
+function rememberJob(jobId) {
+  try { localStorage.setItem(JOB_KEY, jobId); } catch {}
+  try { location.hash = 'job=' + jobId; } catch {}
+}
+function forgetJob() {
+  try { localStorage.removeItem(JOB_KEY); } catch {}
+  // Clear the hash without adding a history entry.
+  try { history.replaceState(null, '', location.pathname + location.search); } catch {}
+}
+function storedJobId() {
+  const m = /(?:^|[#&])job=([^&]+)/.exec(location.hash || '');
+  if (m && m[1]) return decodeURIComponent(m[1]);
+  try { return localStorage.getItem(JOB_KEY); } catch { return null; }
+}
+
 // ---- state ----
 let sourceMode = 'url';
 let destMode = 'demo';
@@ -300,6 +409,10 @@ let currentJob = null;
 let ws = null;
 let countdownTimer = null;
 let expiresAt = null;
+// Destination of the job we're tracking — read from the report/snapshot so a
+// reconnect (where the destination toggle has reset to 'demo') still knows
+// whether the output is BYO or demo.
+let trackingDestination = null;
 
 // ---- gate ----
 $('enter').onclick = doEnter;
@@ -315,13 +428,60 @@ async function doEnter() {
   else { $('gateErr').textContent = (r.body && r.body.error && r.body.error.message) || 'Invalid code'; $('gateErr').classList.remove('hidden'); }
 }
 function showMain() { $('gate').classList.add('hidden'); $('main').classList.remove('hidden'); }
-$('signout').onclick = async (e) => { e.preventDefault(); await api('/logout', { method: 'POST' }); location.reload(); };
+$('signout').onclick = async (e) => { e.preventDefault(); forgetJob(); await api('/logout', { method: 'POST' }); location.reload(); };
 
-// If already authenticated (cookie present + valid), skip the gate.
+// If already authenticated (cookie present + valid), skip the gate and — if a
+// jobId was stored (localStorage or #job= in the URL) — re-attach to it. If the
+// session is gone, the gate stays up and the access-code prompt is shown.
 (async () => {
   const r = await api('/me');
-  if (r.ok) showMain();
+  if (!r.ok) return; // no valid session → access-code prompt stays visible
+  showMain();
+  const jobId = storedJobId();
+  if (jobId) reconnect(jobId);
 })();
+
+/**
+ * Re-attach to a previously-started job after a reload. Restores the file list,
+ * status and metrics from GET /jobs/:id; if the job is still running, re-opens
+ * the WebSocket to resume live progress. A 404 means the job was cleaned up
+ * after its TTL (or never existed) — clear the stored id and fall back to a
+ * fresh state.
+ */
+async function reconnect(jobId) {
+  showReconnect(true, 'Reconnecting to your job…');
+  const r = await api('/jobs/' + jobId);
+  if (r.status === 404) {
+    // Job gone (expired/cleaned up). Forget it and start fresh.
+    forgetJob();
+    showReconnect(false);
+    return;
+  }
+  if (!r.ok || !r.body) {
+    // Transient failure — keep the stored id so a manual reload can retry.
+    showReconnect(false);
+    return;
+  }
+  currentJob = jobId;
+  trackingDestination = r.body.destination || 'demo';
+  const status = r.body.status;
+  $('progressPanel').classList.remove('hidden');
+  $('fileLog').innerHTML = '';
+  renderSnapshot(r.body); // restores files + status + metrics + countdown
+  if (status === 'running' || status === 'pending') {
+    // Still in flight — re-open the socket to resume live updates.
+    openSocket(jobId);
+    pollFallback(jobId);
+    showReconnect(false);
+  } else {
+    // Already finished — nothing live to resume.
+    showReconnect(false);
+  }
+}
+function showReconnect(on, msg) {
+  if (msg) $('reconnectMsg').textContent = msg;
+  $('reconnect').classList.toggle('hidden', !on);
+}
 
 // ---- source toggle ----
 for (const b of $('sourceSeg').querySelectorAll('button')) {
@@ -417,6 +577,8 @@ async function doExtract() {
   updateExtractEnabled();
   if (!r.ok) return showExtractErr((r.body && r.body.error && r.body.error.message) || ('Extract failed (' + r.status + ')'));
   currentJob = r.body.jobId;
+  trackingDestination = destMode;
+  rememberJob(currentJob); // persist so a reload re-attaches to this job
   startTracking(currentJob);
 }
 function showExtractErr(msg) { $('extractErr').textContent = msg; $('extractErr').classList.remove('hidden'); $('extractBtn').disabled = false; }
@@ -426,13 +588,23 @@ function startTracking(jobId) {
   $('progressPanel').classList.remove('hidden');
   $('browserPanel').classList.add('hidden');
   $('fileLog').innerHTML = '';
+  resetPhaseUi();
+  openSocket(jobId);
+  // Fallback poll in case the socket drops.
+  pollFallback(jobId);
+}
+function resetPhaseUi() {
+  for (const el of $('phases').querySelectorAll('.phase')) el.classList.remove('active', 'done');
+  $('parallel').classList.add('hidden');
+  for (const id of ['phIndexTime','phExtractTime','phTotalTime','phDoneSub']) $(id).textContent = '';
+  $('phExtractConc').textContent = 'parallel';
+}
+function openSocket(jobId) {
   if (ws) { try { ws.close(); } catch {} }
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(proto + '://' + location.host + '/jobs/' + jobId + '/ws');
   ws.onmessage = (ev) => { try { handleMessage(JSON.parse(ev.data)); } catch {} };
   ws.onclose = () => {};
-  // Fallback poll in case the socket drops.
-  pollFallback(jobId);
 }
 let pollTimer = null;
 function pollFallback(jobId) {
@@ -455,6 +627,7 @@ function renderSnapshot(s) {
   setPill(s.status);
   renderProgressNums(s);
   renderMetrics(s.metrics);
+  if (s.destination) trackingDestination = s.destination;
   expiresAt = s.expiresAt;
   for (const f of (s.files || [])) renderFile(f);
   if (s.status === 'completed' || s.status === 'failed') onFinished(currentJob, s);
@@ -498,11 +671,62 @@ function renderMetrics(m) {
   $('mTotal').textContent = fmtMs(m.totalMs);
   $('mCompute').textContent = fmtMs(m.computeMs);
   $('mCd').textContent = m.centralDirectoryReads;
+  renderPhase(m);
+}
+
+// ---- phase stepper + parallelism callout ----
+// Drives the "Reading index -> Extracting -> Done" stepper and the cross-isolate
+// parallelism callout from the metrics. Per-phase concurrency differs: the index
+// read is sequential (1×), extraction is workerCount × WORKERS_PER_ISOLATE.
+const PHASE_ORDER = ['reading-index', 'extracting', 'done'];
+function renderPhase(m) {
+  const phase = m.phase || 'idle';
+  const idx = PHASE_ORDER.indexOf(phase);
+  for (const el of $('phases').querySelectorAll('.phase')) {
+    const p = el.dataset.phase;
+    const pIdx = PHASE_ORDER.indexOf(p);
+    el.classList.remove('active', 'done');
+    if (idx < 0) continue;            // idle — no highlight yet
+    if (pIdx < idx) el.classList.add('done');
+    else if (pIdx === idx) el.classList.add(phase === 'done' ? 'done' : 'active');
+  }
+
+  // Extraction sub-label: the live workers × per-isolate concurrency.
+  const workers = m.workerCount || 0;
+  const concurrency = workers > 0 ? workers * WORKERS_PER_ISOLATE : 0;
+  $('phExtractConc').textContent = workers > 0
+    ? ('parallel · ' + workers + '×' + WORKERS_PER_ISOLATE + ' = ' + concurrency)
+    : 'parallel';
+
+  // Per-phase live timings on each step.
+  $('phIndexTime').textContent = m.indexReadMs ? fmtMs(m.indexReadMs) : '';
+  $('phExtractTime').textContent = m.extractionMs ? fmtMs(m.extractionMs) : '';
+  $('phTotalTime').textContent = m.totalMs ? fmtMs(m.totalMs) : '';
+  $('phDoneSub').textContent = phase === 'done' && m.filesExtracted != null
+    ? (m.filesExtracted + ' files')
+    : '';
+
+  // Parallelism callout — make the cross-isolate concurrency legible. Shown
+  // once we have a worker fleet (extraction started) and kept visible after.
+  const showParallel = (phase === 'extracting' || phase === 'done') && workers > 0;
+  $('parallel').classList.toggle('hidden', !showParallel);
+  if (showParallel) {
+    $('pConcurrent').textContent = m.peakConcurrency || 0;
+    // e.g. "24 worker DOs × 6 = 144 concurrent" — explains how peak can exceed
+    // a single isolate's 6-connection cap.
+    $('pFormula').textContent =
+      workers + ' worker DO' + (workers === 1 ? '' : 's') + ' × ' + WORKERS_PER_ISOLATE
+      + ' = ' + concurrency + ' max concurrent';
+  }
 }
 async function onFinished(jobId, s) {
   // File browser
   $('browserPanel').classList.remove('hidden');
-  const isByo = s.destination === 'byo' || destMode === 'byo';
+  // Prefer the report/snapshot's destination; fall back to the tracked
+  // destination (set on extract or reconnect), then the live toggle. On a
+  // reconnect after reload the toggle has reset to 'demo', so the report value
+  // is what makes BYO jobs still render correctly.
+  const isByo = (s.destination || trackingDestination || destMode) === 'byo';
   $('byoNote').classList.toggle('hidden', !isByo);
   if (isByo) {
     $('filesTable').classList.add('hidden');
@@ -531,7 +755,12 @@ function startCountdown() {
   const tick = () => {
     const left = expiresAt - Date.now();
     $('countdown').textContent = fmtCountdown(left);
-    if (left <= 0) clearInterval(countdownTimer);
+    if (left <= 0) {
+      clearInterval(countdownTimer);
+      // The demo output has been cleaned up — drop the stored id so a later
+      // reload starts fresh instead of trying to reconnect to a gone job.
+      forgetJob();
+    }
   };
   tick();
   countdownTimer = setInterval(tick, 1000);
