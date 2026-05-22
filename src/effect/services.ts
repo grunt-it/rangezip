@@ -9,9 +9,72 @@
  * on `fetch` or a concrete R2 binding — which keeps it swappable in tests.
  */
 
-import { Context, Effect, Layer } from 'effect';
+import { Context, Effect, Layer, Schedule } from 'effect';
 import { R2WriteError, RangeFetchError } from './errors';
 import type { MetricsSink } from './metrics-sink';
+
+// -------------------------------------------------------------------------------------------------
+// Range-fetch retry policy
+// -------------------------------------------------------------------------------------------------
+
+/**
+ * HTTP statuses that represent a TRANSIENT source failure worth retrying:
+ * rate-limiting (429) and the transient 5xx family that an origin / CDN throws
+ * under load (500/502/503). Everything else (404/416/403/401, other permanent
+ * 4xx) is a PERMANENT failure — retrying just burns the attempt budget.
+ *
+ * The live failure mode this exists for: under the 144-way DO fan-out the
+ * source (R2's public `r2.dev` URL) rate-limits a chunk of range fetches with
+ * 429; the 429 clears on a backed-off retry.
+ */
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503]);
+
+/** Statuses for which a `Retry-After` header is meaningful (and worth honouring). */
+const RETRY_AFTER_STATUSES = new Set([429, 503]);
+
+/** Base delay for the exponential backoff between range-fetch retries. */
+const RETRY_BASE_DELAY = '250 millis';
+/** Hard cap on retry attempts (so a genuinely-down source fails in bounded time). */
+const RETRY_MAX_RECURRENCES = 5;
+/** Overall elapsed budget — a second guard so retries can't run unbounded. */
+const RETRY_MAX_ELAPSED = '30 seconds';
+/** Cap on how long a server-supplied `Retry-After` can hold us (avoid a 1h park). */
+const RETRY_AFTER_CAP_MS = 5_000;
+
+/**
+ * The retry schedule for range fetches: exponential backoff (250ms base, ×2)
+ * with full jitter to de-correlate the 144 workers' retries, intersected with a
+ * recurrence cap AND an elapsed-time cap (whichever trips first stops it). The
+ * `intersect` semantics mean BOTH the per-step backoff schedule and the caps
+ * must agree to continue, so it stops at 5 retries or 30s elapsed.
+ */
+const rangeRetrySchedule = Schedule.exponential(RETRY_BASE_DELAY).pipe(
+  Schedule.jittered,
+  Schedule.intersect(Schedule.recurs(RETRY_MAX_RECURRENCES)),
+  Schedule.upTo(RETRY_MAX_ELAPSED),
+);
+
+/**
+ * Parse a `Retry-After` header into milliseconds, capped at {@link RETRY_AFTER_CAP_MS}.
+ * Supports both the delta-seconds form (`Retry-After: 3`) and the HTTP-date form
+ * (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Returns `undefined` if absent
+ * or unparseable. Negative / past dates clamp to 0.
+ */
+function parseRetryAfterMs(header: string | null): number | undefined {
+  if (!header) return undefined;
+  const trimmed = header.trim();
+  if (trimmed === '') return undefined;
+
+  // delta-seconds form
+  if (/^\d+$/.test(trimmed)) {
+    return Math.min(Number(trimmed) * 1000, RETRY_AFTER_CAP_MS);
+  }
+  // HTTP-date form
+  const when = Date.parse(trimmed);
+  if (Number.isNaN(when)) return undefined;
+  const deltaMs = when - Date.now();
+  return Math.min(Math.max(deltaMs, 0), RETRY_AFTER_CAP_MS);
+}
 
 // -------------------------------------------------------------------------------------------------
 // Source — range reads over the remote archive
@@ -50,35 +113,72 @@ export class Source extends Context.Tag('Source')<
  * reflects bytes actually pulled over the wire.
  */
 export function makeHttpSource(sourceUrl: string, metrics?: MetricsSink): Layer.Layer<Source> {
-  const fetchRange = (range: ByteRange) =>
+  /**
+   * Issue one `Range` GET and assert a usable status, retrying transient
+   * failures with backoff. The retry wraps fetch + the 206/200 status check, so
+   * a retryable status (or a network/timeout/connection error) re-issues the
+   * whole range request; only once a usable response arrives do callers stream
+   * its body. The success metric (`metrics?.range`) is recorded INSIDE the
+   * retried unit but only on the success branch, so retried 429s don't double-
+   * count bytes — the metric fires exactly once, when the fetch finally lands.
+   */
+  const fetchRangeOnce = (headers: Record<string, string>, onSuccess: () => void) =>
     Effect.tryPromise({
-      try: () =>
-        fetch(sourceUrl, {
-          headers: { Range: `bytes=${range.start}-${range.end - 1}` },
-        }),
+      try: () => fetch(sourceUrl, { headers }),
+      // A thrown fetch = network/timeout/connection error: transient, retry it.
       catch: (cause) =>
-        new RangeFetchError(`Network error fetching range from ${sourceUrl}`, cause),
+        new RangeFetchError(`Network error fetching range from ${sourceUrl}`, cause, {
+          retryable: true,
+        }),
     }).pipe(
-      Effect.filterOrFail(
-        (res) => res.status === 206 || res.status === 200,
-        (res) =>
+      Effect.flatMap((res) => {
+        if (res.status === 206 || res.status === 200) {
+          onSuccess();
+          return Effect.succeed(res);
+        }
+        const retryable = RETRYABLE_STATUSES.has(res.status);
+        const retryAfterMs = RETRY_AFTER_STATUSES.has(res.status)
+          ? parseRetryAfterMs(res.headers.get('retry-after'))
+          : undefined;
+        const fail = Effect.fail(
           new RangeFetchError(
             `Source did not honour the byte-range request (status ${res.status}); the URL must support HTTP range requests`,
+            undefined,
+            { retryable, retryAfterMs },
           ),
+        );
+        // Honour a server-requested cooldown as a FLOOR before the next retry:
+        // sleep it, then fail so the schedule's own backoff applies on top.
+        return retryAfterMs !== undefined
+          ? Effect.zipRight(Effect.sleep(`${retryAfterMs} millis`), fail)
+          : fail;
+      }),
+    );
+
+  /** Apply the shared backoff policy, retrying only while the error is retryable. */
+  const withRetry = <A>(effect: Effect.Effect<A, RangeFetchError>) =>
+    effect.pipe(
+      Effect.retry({ schedule: rangeRetrySchedule, while: (e: RangeFetchError) => e.retryable }),
+    );
+
+  const fetchRange = (range: ByteRange) =>
+    withRetry(
+      fetchRangeOnce({ Range: `bytes=${range.start}-${range.end - 1}` }, () =>
+        metrics?.range(range.start, range.end),
       ),
-      Effect.tap(() => Effect.sync(() => metrics?.range(range.start, range.end))),
     );
 
   return Layer.succeed(Source, {
     size: Effect.gen(function* () {
-      const res = yield* Effect.tryPromise({
-        try: () => fetch(sourceUrl, { headers: { Range: 'bytes=0-0' } }),
-        catch: (cause) => new RangeFetchError(`Network error probing size of ${sourceUrl}`, cause),
-      });
+      // The size probe is a range request too — retry it on the same transient
+      // failures (429/5xx/network) so a rate-limited probe doesn't fail the job.
+      const res = yield* withRetry(fetchRangeOnce({ Range: 'bytes=0-0' }, () => {}));
       const contentRange = res.headers.get('content-range');
       // Format: "bytes 0-0/123456" — the part after the slash is the total.
       const total = contentRange?.split('/')[1];
       if (!total || total === '*' || Number.isNaN(Number(total))) {
+        // Malformed Content-Range on an otherwise-OK response is PERMANENT —
+        // retrying won't conjure a length. Fail fast (retryable defaults false).
         return yield* Effect.fail(
           new RangeFetchError(
             `Source did not return a usable Content-Range total size for ${sourceUrl}`,

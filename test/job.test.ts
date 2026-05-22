@@ -115,9 +115,14 @@ describe('ExtractJob.start', () => {
   it('durably records a pending job and returns its id immediately', async () => {
     const stub = env.EXTRACT_JOB.getByName('start-test');
 
-    // The source refuses connections, so the background extraction fails fast
-    // and records a job-level failure — but `start` itself returns immediately
-    // with a pending job (it must not block on the extraction).
+    // The source refuses connections. A connection error is a RETRYABLE
+    // range-fetch failure (exactly the transient network class the retry policy
+    // targets), so the background extraction now backs off and retries the size
+    // probe up to the policy's cap (~5 retries / 30s elapsed) before recording a
+    // job-level failure — it no longer fails on the first refused connection.
+    // `start` itself still returns immediately with a pending job (it must not
+    // block on the extraction); the `waitFor` below is widened to cover the full
+    // retry budget so we assert the eventual RECORDED failure, not a leak.
     const sourceUrl = 'http://127.0.0.1:1/archive.zip';
     const accepted = await stub.start({
       id: 'start-test',
@@ -144,15 +149,17 @@ describe('ExtractJob.start', () => {
     // Drain the background promise so the failed fetch settles before the test
     // tears down: a dead source must end as a RECORDED failure, never a leaked
     // rejection. (`runJob` catches into SQLite; this asserts that contract.)
+    // Timeout covers the retry budget — the size probe backs off through its
+    // retries before the connection error is finally recorded as a failure.
     await vi.waitFor(
       async () => {
         const report = await stub.report();
         expect(report?.status).toBe('failed');
         expect(report?.error).not.toBeNull();
       },
-      { timeout: 5000, interval: 25 },
+      { timeout: 35_000, interval: 100 },
     );
-  });
+  }, 40_000);
 });
 
 describe('ExtractJob.report — new fields', () => {

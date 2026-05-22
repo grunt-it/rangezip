@@ -31,10 +31,37 @@ export function isTaggedError(error: unknown): error is { _tag: string } & Error
   );
 }
 
-/** A byte-range GET against the source URL failed or returned the wrong shape. */
+/**
+ * A byte-range GET against the source URL failed or returned the wrong shape.
+ *
+ * Carries a `retryable` flag so the range-fetch retry policy (exponential
+ * backoff + jitter, see `services.ts`) can retry transient failures — HTTP 429
+ * / 503 / 502 / 500 and network/timeout/connection errors — while letting
+ * permanent failures (404 / 416 / 403 / 401, other permanent 4xx, malformed
+ * Content-Range) fail fast. `retryAfterMs`, when set, is a server-requested
+ * minimum cooldown parsed from a `Retry-After` header (capped); the fetch sleeps
+ * it before failing so the next retry honours it as a floor.
+ */
 export class RangeFetchError extends Data.TaggedError('RangeFetchError')<ErrorParams> {
-  constructor(message: string, cause?: unknown) {
-    super({ message, status: 502, cause });
+  /** Whether this failure is worth retrying (transient). Defaults to `false`. */
+  readonly retryable: boolean;
+  /** Server-requested cooldown (ms) from a `Retry-After` header, if any. */
+  readonly retryAfterMs?: number;
+
+  constructor(
+    message: string,
+    cause?: unknown,
+    options: { retryable?: boolean; retryAfterMs?: number } = {},
+  ) {
+    super({
+      message,
+      status: 502,
+      cause,
+      retryable: options.retryable ?? false,
+      retryAfterMs: options.retryAfterMs,
+    });
+    this.retryable = options.retryable ?? false;
+    this.retryAfterMs = options.retryAfterMs;
   }
 }
 
