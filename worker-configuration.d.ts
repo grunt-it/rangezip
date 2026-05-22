@@ -11,6 +11,8 @@
 interface RangezipEnv {
   OUTPUT: R2Bucket;
   EXTRACT_JOB: DurableObjectNamespace<import('./src/worker').ExtractJob>;
+  /** Per-shard extraction workers — the coordinator fans shards out across these. */
+  EXTRACT_WORKER: DurableObjectNamespace<import('./src/worker').ExtractWorker>;
   /** Singleton registry of access codes + usage events (addressed by name). */
   REGISTRY: DurableObjectNamespace<import('./src/worker').Registry>;
   /** HMAC key for signing session cookies, both code + admin (secret). */

@@ -20,6 +20,13 @@
         "name": "EXTRACT_JOB",
         "class_name": "ExtractJob",
       },
+      // Per-shard extraction workers. The coordinator fans a job's entries out
+      // across many of these (each its own isolate / 6-connection budget) for
+      // true N×6 parallelism — addressed by `getByName("${jobId}:w${i}")`.
+      {
+        "name": "EXTRACT_WORKER",
+        "class_name": "ExtractWorker",
+      },
       // Singleton registry of access codes + usage events (idFromName "registry").
       {
         "name": "REGISTRY",
@@ -36,6 +43,13 @@
       // v2 introduces the Registry SQLite class — append-only, never edit v1.
       "tag": "v2",
       "new_sqlite_classes": ["Registry"],
+    },
+    {
+      // v3 introduces the ExtractWorker class. It holds NO durable state of its
+      // own (all authoritative state lives in the coordinator's SQLite), so it
+      // uses the non-SQLite `new_classes` form. Append-only — never edit v1/v2.
+      "tag": "v3",
+      "new_classes": ["ExtractWorker"],
     },
   ],
   "r2_buckets": [

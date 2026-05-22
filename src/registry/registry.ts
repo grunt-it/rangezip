@@ -116,8 +116,12 @@ export class Registry extends DurableObject<RegistryEnv> {
    * Ordered newest-first.
    */
   async listCodes(): Promise<CodeSummary[]> {
+    // `rowid DESC` is the stable tiebreak: two codes created in the SAME
+    // millisecond have equal `created_at`, so ordering by that alone is
+    // non-deterministic. rowid is monotonic insertion order, so the secondary
+    // sort keeps "newest-first" deterministic even for codes minted back-to-back.
     const codes = this.ctx.storage.sql
-      .exec<CodeRow>('SELECT * FROM codes ORDER BY created_at DESC')
+      .exec<CodeRow>('SELECT * FROM codes ORDER BY created_at DESC, rowid DESC')
       .toArray();
     if (codes.length === 0) return [];
 

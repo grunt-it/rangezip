@@ -19,7 +19,15 @@
  * is explicit.
  */
 
-import { recordConcurrency, recordRange, ZERO_METRICS, type RawMetrics } from '../metrics';
+import {
+  mergeWorkerMetrics,
+  recordConcurrency,
+  recordRange,
+  ZERO_METRICS,
+  type JobPhase,
+  type RawMetrics,
+  type WorkerMetricsContribution,
+} from '../metrics';
 
 export class MetricsSink {
   private raw: RawMetrics = { ...ZERO_METRICS };
@@ -67,6 +75,25 @@ export class MetricsSink {
   /** Set the extraction-phase wallclock (ms). */
   setExtractionMs(ms: number): void {
     this.raw = { ...this.raw, extractionMs: ms };
+  }
+
+  /** Set the current job phase (idle → reading-index → extracting → done). */
+  setPhase(phase: JobPhase): void {
+    this.raw = { ...this.raw, phase };
+  }
+
+  /** Record how many extraction worker DOs the job fanned out across. */
+  setWorkerCount(count: number): void {
+    this.raw = { ...this.raw, workerCount: count };
+  }
+
+  /**
+   * Fold one worker DO's measured contribution into the job-wide counters
+   * (bytes fetched, requests, compute, R2 writes, files). Used by the
+   * coordinator as each shard's summary returns — see {@link mergeWorkerMetrics}.
+   */
+  mergeWorker(contribution: WorkerMetricsContribution): void {
+    this.raw = mergeWorkerMetrics(this.raw, contribution);
   }
 
   /** Snapshot the current raw counters (immutable copy). */

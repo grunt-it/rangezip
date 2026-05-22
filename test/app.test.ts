@@ -35,6 +35,7 @@ beforeAll(async () => {
 function makeEnv(overrides: Partial<Env> = {}): Env {
   return {
     EXTRACT_JOB: testEnv.EXTRACT_JOB,
+    EXTRACT_WORKER: testEnv.EXTRACT_WORKER,
     REGISTRY: testEnv.REGISTRY,
     OUTPUT: testEnv.OUTPUT,
     SESSION_SECRET: 'unit-test-session-secret',

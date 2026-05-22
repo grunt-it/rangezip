@@ -24,11 +24,26 @@
  *                               every file extraction — a real reuse metric).
  */
 
+/**
+ * Which phase of the job is currently running. Emitted in progress messages so
+ * the UI can show that the (sequential, concurrency-1) index read precedes the
+ * (parallel, N×6) extraction fan-out. `idle` before a job starts; `done` once
+ * everything has settled.
+ */
+export type JobPhase = 'idle' | 'reading-index' | 'extracting' | 'done';
+
 /** Raw counters accumulated during a run, persisted in the DO. */
 export interface RawMetrics {
   readonly archiveSize: number;
   readonly rangeBytesFetched: number;
   readonly rangeRequestCount: number;
+  /**
+   * Peak simultaneous extractions observed. With the fan-out architecture this
+   * is the peak of the SUM of in-flight counts ACROSS ALL worker DOs (each
+   * worker reports its own in-flight count; the coordinator sums and tracks the
+   * max). So it reflects true cross-isolate parallelism (~N×6), not the 6-cap of
+   * a single isolate.
+   */
   readonly peakConcurrency: number;
   readonly computeMs: number;
   readonly indexReadMs: number;
@@ -36,6 +51,14 @@ export interface RawMetrics {
   readonly r2Writes: number;
   readonly centralDirectoryReads: number;
   readonly filesExtracted: number;
+  /**
+   * How many extraction worker DOs the job fanned out across (0 for an
+   * index-only or empty job). A real, measured fleet size — the headline that
+   * explains how `peakConcurrency` can exceed a single isolate's 6-connection cap.
+   */
+  readonly workerCount: number;
+  /** The current job phase — see {@link JobPhase}. */
+  readonly phase: JobPhase;
 }
 
 /** The zero state for a fresh job. */
@@ -50,6 +73,8 @@ export const ZERO_METRICS: RawMetrics = {
   r2Writes: 0,
   centralDirectoryReads: 0,
   filesExtracted: 0,
+  workerCount: 0,
+  phase: 'idle',
 };
 
 /** The derived view the UI renders — raw counters plus computed labels. */
@@ -106,4 +131,46 @@ export function recordRange(raw: RawMetrics, start: number, end: number): RawMet
 /** Raise the recorded peak concurrency if `current` exceeds it. */
 export function recordConcurrency(raw: RawMetrics, current: number): RawMetrics {
   return current > raw.peakConcurrency ? { ...raw, peakConcurrency: current } : raw;
+}
+
+/**
+ * The slice of a worker's measured counters that the coordinator aggregates
+ * into the job-wide totals. Each `ExtractWorker` extracts its shard with its own
+ * `MetricsSink`, then hands these back so the headline numbers (bytes fetched,
+ * R2 writes, compute time, files done) reflect the WHOLE fan-out, not just the
+ * coordinator's own index read.
+ *
+ * NB: `archiveSize` and `centralDirectoryReads` are NOT here — those are owned
+ * by the coordinator (it reads the index once and reuses it; the workers don't
+ * re-probe the size or re-read the central directory). Folding them in would
+ * double-count. `peakConcurrency` is handled separately (live, via per-worker
+ * in-flight reports) — a worker's local peak can't simply be summed after the
+ * fact because the workers don't peak at the same instant.
+ */
+export interface WorkerMetricsContribution {
+  readonly rangeBytesFetched: number;
+  readonly rangeRequestCount: number;
+  readonly computeMs: number;
+  readonly r2Writes: number;
+  readonly filesExtracted: number;
+}
+
+/**
+ * Fold one worker's contribution into the running coordinator counters. Pure and
+ * additive — call it once per worker as its shard summary comes back. Leaves
+ * `archiveSize`, `centralDirectoryReads`, `peakConcurrency`, phase, and the
+ * phase timings untouched (those are coordinator-owned; see the type doc above).
+ */
+export function mergeWorkerMetrics(
+  raw: RawMetrics,
+  contribution: WorkerMetricsContribution,
+): RawMetrics {
+  return {
+    ...raw,
+    rangeBytesFetched: raw.rangeBytesFetched + contribution.rangeBytesFetched,
+    rangeRequestCount: raw.rangeRequestCount + contribution.rangeRequestCount,
+    computeMs: raw.computeMs + contribution.computeMs,
+    r2Writes: raw.r2Writes + contribution.r2Writes,
+    filesExtracted: raw.filesExtracted + contribution.filesExtracted,
+  };
 }

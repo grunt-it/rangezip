@@ -47,10 +47,12 @@ import { renderAdminPage } from './admin-ui';
 import { SAMPLE_PRESETS } from './samples';
 import { Effect } from 'effect';
 import type { Destination, ExtractJob } from './job';
+import type { ExtractWorker } from './extract-worker';
 import type { ZipEntry } from './zip';
 
 export interface Env extends AuthEnv {
   EXTRACT_JOB: DurableObjectNamespace<ExtractJob>;
+  EXTRACT_WORKER: DurableObjectNamespace<ExtractWorker>;
   REGISTRY: DurableObjectNamespace<Registry>;
   OUTPUT: R2Bucket;
   EXTRACT_TTL_HOURS?: string;

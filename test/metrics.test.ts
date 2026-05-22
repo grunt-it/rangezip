@@ -7,10 +7,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   deriveMetrics,
+  mergeWorkerMetrics,
   recordConcurrency,
   recordRange,
   ZERO_METRICS,
   type RawMetrics,
+  type WorkerMetricsContribution,
 } from '../src/metrics';
 
 describe('recordRange', () => {
@@ -37,6 +39,65 @@ describe('recordConcurrency', () => {
     expect(m.peakConcurrency).toBe(3);
     m = recordConcurrency(m, 6); // higher — raises
     expect(m.peakConcurrency).toBe(6);
+  });
+});
+
+describe('mergeWorkerMetrics', () => {
+  const contribution: WorkerMetricsContribution = {
+    rangeBytesFetched: 1000,
+    rangeRequestCount: 5,
+    computeMs: 12.5,
+    r2Writes: 3,
+    filesExtracted: 3,
+  };
+
+  it('adds the worker counters into the running totals', () => {
+    const base: RawMetrics = {
+      ...ZERO_METRICS,
+      rangeBytesFetched: 200,
+      rangeRequestCount: 2,
+      computeMs: 1,
+      r2Writes: 1,
+      filesExtracted: 1,
+    };
+    const merged = mergeWorkerMetrics(base, contribution);
+    expect(merged.rangeBytesFetched).toBe(1200);
+    expect(merged.rangeRequestCount).toBe(7);
+    expect(merged.computeMs).toBe(13.5);
+    expect(merged.r2Writes).toBe(4);
+    expect(merged.filesExtracted).toBe(4);
+  });
+
+  it('leaves coordinator-owned fields untouched (no double-counting)', () => {
+    const base: RawMetrics = {
+      ...ZERO_METRICS,
+      archiveSize: 5000,
+      centralDirectoryReads: 1,
+      peakConcurrency: 12,
+      indexReadMs: 9,
+      extractionMs: 0,
+      workerCount: 3,
+      phase: 'extracting',
+    };
+    const merged = mergeWorkerMetrics(base, contribution);
+    // These belong to the coordinator and must NOT be folded in from a worker.
+    expect(merged.archiveSize).toBe(5000);
+    expect(merged.centralDirectoryReads).toBe(1);
+    expect(merged.peakConcurrency).toBe(12);
+    expect(merged.indexReadMs).toBe(9);
+    expect(merged.extractionMs).toBe(0);
+    expect(merged.workerCount).toBe(3);
+    expect(merged.phase).toBe('extracting');
+  });
+
+  it('is additive across multiple workers', () => {
+    let m: RawMetrics = ZERO_METRICS;
+    m = mergeWorkerMetrics(m, contribution);
+    m = mergeWorkerMetrics(m, contribution);
+    m = mergeWorkerMetrics(m, contribution);
+    expect(m.filesExtracted).toBe(9);
+    expect(m.r2Writes).toBe(9);
+    expect(m.rangeBytesFetched).toBe(3000);
   });
 });
 

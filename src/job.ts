@@ -28,16 +28,16 @@
  */
 
 import { DurableObject } from 'cloudflare:workers';
-import { extractEntry, readIndex } from './extract';
+import { readIndex } from './extract';
 import { makeRuntime, run, type AppRuntime } from './effect/runtime';
 import { MetricsSink } from './effect/metrics-sink';
 import { deriveMetrics, ZERO_METRICS, type MetricsView, type RawMetrics } from './metrics';
-import { composePrefix, makeByoBucket, type ByoConfig } from './destination';
-import { Layer, ManagedRuntime } from 'effect';
-import { makeHttpSource } from './effect/services';
+import { composePrefix, type ByoConfig } from './destination';
 import { overallPercent, type ProgressMessage } from './progress';
 import { EVENT_TYPES } from './registry/codes';
 import { REGISTRY_NAME, type Registry } from './registry/registry';
+import { shardEntries, DEFAULT_MAX_WORKERS } from './shard';
+import type { ExtractWorker, FileReport, ShardSummary } from './extract-worker';
 import type { ZipEntry } from './zip';
 
 /** Bindings the DO needs. Mirrors the Worker `Env`. */
@@ -45,11 +45,18 @@ export interface JobEnv {
   OUTPUT: R2Bucket;
   /** Singleton registry — for recording per-code usage events. */
   REGISTRY: DurableObjectNamespace<Registry>;
+  /** The extraction-worker namespace — the coordinator fans shards out across these. */
+  EXTRACT_WORKER: DurableObjectNamespace<ExtractWorker>;
   EXTRACT_TTL_HOURS?: string;
 }
 
-/** How many files to extract simultaneously. Bounds open range reads + memory. */
-const CONCURRENCY = 6;
+/**
+ * Hard ceiling on the number of `ExtractWorker` DOs a single job spawns. Each
+ * worker is its own isolate with a 6-connection budget, so effective concurrency
+ * is `MAX_WORKERS × 6` (~144 at the cap). High enough for strong parallelism,
+ * bounded so we don't hammer the source URL into rate-limits.
+ */
+const MAX_WORKERS = DEFAULT_MAX_WORKERS;
 
 /** Default cleanup TTL for demo-bucket output, in hours. */
 const DEFAULT_TTL_HOURS = 2;
@@ -124,8 +131,27 @@ export class ExtractJob extends DurableObject<JobEnv> {
    * written to SQLite, logged, or returned. Cleared when the run completes.
    */
   private byoConfig: ByoConfig | null = null;
-  /** In-flight extraction count, for the peak-concurrency metric. */
-  private inFlight = 0;
+  /**
+   * Per-worker in-flight extraction counts, keyed by shard index. Each worker
+   * stamps its current in-flight count on every file report; the coordinator
+   * sums these across ALL workers and feeds the total to the peak-concurrency
+   * metric. This is what makes the headline reflect true `N×6` cross-isolate
+   * parallelism instead of one isolate's 6-connection cap. DO input-gates
+   * serialize concurrent `reportFileResult` calls, so this map is mutated under
+   * an effective lock — no torn reads.
+   */
+  private workerInFlight = new Map<number, number>();
+  /**
+   * Wallclock (`performance.now()`) when each phase began, set when the phase
+   * starts and used to compute LIVE elapsed timings mid-run. Without these,
+   * `report()` would show `extractionMs: 0` (and a too-low `totalMs`) until the
+   * phase finished and `setExtractionMs` ran — the bug where the UI read 0ms /
+   * 401ms while compute was actually seconds in. Instance fields, so they live
+   * for the active run (the DO stays alive on pending I/O); once a phase ends its
+   * final measured `*Ms` is folded into the snapshot, which survives eviction.
+   */
+  private indexStartedAt: number | null = null;
+  private extractStartedAt: number | null = null;
 
   constructor(ctx: DurableObjectState, env: JobEnv) {
     super(ctx, env);
@@ -168,6 +194,9 @@ export class ExtractJob extends DurableObject<JobEnv> {
   async start(input: StartInput): Promise<{ id: string; status: JobStatus }> {
     this.metrics = new MetricsSink();
     this.byoConfig = input.byo ?? null; // transient, in-memory only
+    this.workerInFlight = new Map();
+    this.indexStartedAt = null;
+    this.extractStartedAt = null;
 
     // The output key prefix is derived from the per-job id — never a
     // user-supplied value — so two jobs can NEVER collide on R2 keys (one job's
@@ -316,33 +345,32 @@ export class ExtractJob extends DurableObject<JobEnv> {
   // -----------------------------------------------------------------------------------------------
 
   /**
-   * Build the Effect runtime for a job. A `protected` seam (rather than a
-   * direct `makeRuntime` call) so tests can subclass the DO and swap in an
-   * in-memory `Source`, without any test-only branching in the hot path.
-   *
-   * The runtime's `Bucket` is the demo R2 binding OR a SigV4 BYO bucket; both
-   * are wired to the same `MetricsSink` so writes are counted identically.
+   * Build the Effect runtime the COORDINATOR uses — only ever for the sequential
+   * `readIndex` (range reads over the source). The coordinator no longer writes
+   * to a bucket itself (the worker DOs do that), so the `Bucket` layer here is
+   * the demo binding unconditionally: it's never exercised for BYO jobs, whose
+   * writes happen in the workers with the BYO credentials. A `protected` seam so
+   * tests can subclass the DO and swap in an in-memory `Source` without test-only
+   * branching on the hot path.
    */
   protected createRuntime(sourceUrl: string): AppRuntime {
-    if (this.byoConfig) {
-      const layer = Layer.mergeAll(
-        makeHttpSource(sourceUrl, this.metrics),
-        makeByoBucket(this.byoConfig, this.metrics),
-      );
-      return ManagedRuntime.make(layer);
-    }
     return makeRuntime(sourceUrl, this.env.OUTPUT, this.metrics);
   }
 
   private async runJob(input: StartInput, prefix: string): Promise<void> {
+    // The coordinator only needs a runtime for the (sequential) index read —
+    // extraction itself runs in the worker DOs. So this runtime never needs a
+    // Bucket write; the demo-bucket variant of `createRuntime` is fine either way.
     const rt = this.createRuntime(input.sourceUrl);
     const startedAt = Date.now();
     try {
       this.setJobStatus('running');
       await this.broadcastSnapshot();
 
-      // Phase 1: index read (measured wallclock).
+      // Phase 1: index read (measured wallclock) — sequential, concurrency 1.
+      this.metrics.setPhase('reading-index');
       const indexStart = performance.now();
+      this.indexStartedAt = indexStart;
       const entries = await run(rt, readIndex(this.metrics));
       this.metrics.setIndexReadMs(performance.now() - indexStart);
 
@@ -366,11 +394,15 @@ export class ExtractJob extends DurableObject<JobEnv> {
       this.persistMetrics();
       await this.broadcastSnapshot();
 
-      // Phase 2: extraction (measured wallclock). The prefix is jobId-scoped
-      // (derived in `start`, passed through here) — never a user value.
+      // Phase 2: extraction (measured wallclock) — fan out across worker DOs,
+      // each its own isolate with its own 6-connection budget. The prefix is
+      // jobId-scoped (derived in `start`) so every worker writes UNDER `<jobId>/`.
+      this.metrics.setPhase('extracting');
       const extractStart = performance.now();
-      await this.extractAll(rt, selected, prefix);
+      this.extractStartedAt = extractStart;
+      await this.fanOutExtraction(input, selected, prefix);
       this.metrics.setExtractionMs(performance.now() - extractStart);
+      this.metrics.setPhase('done');
       this.persistMetrics();
 
       // A job is "completed" even if some files failed — per-file failures are
@@ -390,6 +422,7 @@ export class ExtractJob extends DurableObject<JobEnv> {
       await this.broadcastDone('completed');
     } catch (err) {
       this.recordJobError(err);
+      this.metrics.setPhase('done');
       this.persistMetrics();
       await this.broadcastDone('failed');
     } finally {
@@ -438,54 +471,136 @@ export class ExtractJob extends DurableObject<JobEnv> {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_TTL_HOURS;
   }
 
-  /** Extract entries with a bounded worker pool of size {@link CONCURRENCY}. */
-  private async extractAll(
-    rt: AppRuntime,
+  /**
+   * Fan the selected entries out across `ExtractWorker` DOs and await all of
+   * them. This is the heart of the parallel re-architecture: each shard runs in
+   * its own isolate with its own 6-connection budget, so effective concurrency
+   * is `workerCount × 6` instead of the single coordinator isolate's 6.
+   *
+   * Steps:
+   *   1. Shard the entries balanced by BYTES (big files don't pile on one
+   *      worker) into `min(MAX_WORKERS, ceil(files / FILES_PER_WORKER))` shards.
+   *   2. Record the real fleet size on the metrics (a measured number).
+   *   3. Spawn each worker as `EXTRACT_WORKER.getByName(`${jobId}:w${i}`)` and
+   *      call `extractShard` in parallel — fire them, await all.
+   *   4. Fold each returned shard summary's counters into the job-wide metrics.
+   *
+   * Per-shard failures (a worker that throws entirely, e.g. a runtime build
+   * error) are isolated: the files it owned are marked failed and the rest of
+   * the job still completes — mirroring the per-file isolation guarantee.
+   */
+  private async fanOutExtraction(
+    input: StartInput,
     entries: readonly ZipEntry[],
     prefix: string,
   ): Promise<void> {
-    const queue = [...entries];
-    const worker = async (): Promise<void> => {
-      for (let entry = queue.shift(); entry !== undefined; entry = queue.shift()) {
-        await this.extractOne(rt, entry, prefix);
-      }
-    };
-    const pool = Array.from({ length: Math.min(CONCURRENCY, entries.length) }, worker);
-    await Promise.all(pool);
+    if (entries.length === 0) {
+      this.metrics.setWorkerCount(0);
+      return;
+    }
+
+    const shards = shardEntries(entries, {
+      maxWorkers: MAX_WORKERS,
+      filesPerWorker: 4,
+    });
+    this.metrics.setWorkerCount(shards.length);
+    this.persistMetrics();
+
+    await Promise.all(
+      shards.map(async (shard) => {
+        const worker = this.env.EXTRACT_WORKER.getByName(`${input.id}:w${shard.index}`);
+        try {
+          const summary = await worker.extractShard({
+            jobId: input.id,
+            workerIndex: shard.index,
+            sourceUrl: input.sourceUrl,
+            prefix,
+            entries: shard.entries,
+            byo: this.byoConfig ?? undefined,
+          });
+          this.applyShardSummary(summary);
+        } catch (err) {
+          // The whole shard failed to run (couldn't build a runtime, RPC died).
+          // Mark every entry it owned as failed so the job's totals are honest,
+          // and clear the worker's in-flight contribution.
+          this.failShard(shard.index, shard.entries, errorMessage(err));
+        }
+      }),
+    );
   }
 
-  /** Extract one entry, recording success or an isolated per-file failure. */
-  private async extractOne(rt: AppRuntime, entry: ZipEntry, prefix: string): Promise<void> {
-    this.inFlight += 1;
-    this.metrics.observeConcurrency(this.inFlight);
-    this.markFile(entry.name, 'extracting');
-    await this.broadcastFile(entry.name);
-    try {
-      const result = await run(rt, extractEntry(entry, prefix, this.metrics));
+  /**
+   * Fold a finished worker's shard summary into the coordinator's metrics: add
+   * its measured byte/compute/R2/file counters to the job-wide totals, and clear
+   * the worker's in-flight entry (it's done — no longer contributing to the live
+   * concurrency sum). The authoritative per-file rows were already written by the
+   * `reportFileResult` callbacks during the run.
+   */
+  private applyShardSummary(summary: ShardSummary): void {
+    this.metrics.mergeWorker(summary.metrics);
+    this.workerInFlight.delete(summary.workerIndex);
+    this.persistMetrics();
+  }
+
+  /**
+   * A worker that died entirely: mark every entry it owned as failed (unless a
+   * prior report already settled it) and drop its in-flight contribution.
+   */
+  private failShard(workerIndex: number, entries: readonly ZipEntry[], message: string): void {
+    for (const entry of entries) {
       this.ctx.storage.sql.exec(
-        'UPDATE file SET key = ?, status = ?, bytes = ?, error = NULL WHERE name = ?',
-        result.key,
-        'done' satisfies FileStatus,
-        result.bytesWritten,
+        "UPDATE file SET status = ?, error = ? WHERE name = ? AND status NOT IN ('done', 'failed')",
+        'failed' satisfies FileStatus,
+        message,
         entry.name,
       );
-      await this.broadcastFile(entry.name);
-    } catch (err) {
+    }
+    this.workerInFlight.delete(workerIndex);
+    this.persistMetrics();
+  }
+
+  /**
+   * RPC: a worker reports one file's status transition, stamped with that
+   * worker's current in-flight count. The coordinator:
+   *   - Updates the authoritative `file` row in SQLite.
+   *   - Records the worker's in-flight count and observes the SUM across all
+   *     workers as the live peak-concurrency metric (true `N×6` parallelism).
+   *   - Broadcasts the per-file delta to connected WebSocket clients.
+   *
+   * DO input-gates serialize concurrent `reportFileResult` calls from different
+   * workers, so the in-flight map and the peak observation are race-free.
+   */
+  async reportFileResult(report: FileReport): Promise<void> {
+    // Track this worker's in-flight count and raise the cross-worker peak.
+    this.workerInFlight.set(report.workerIndex, report.inFlight);
+    let totalInFlight = 0;
+    for (const n of this.workerInFlight.values()) totalInFlight += n;
+    this.metrics.observeConcurrency(totalInFlight);
+
+    if (report.status === 'done') {
+      this.ctx.storage.sql.exec(
+        'UPDATE file SET key = ?, status = ?, bytes = ?, error = NULL WHERE name = ?',
+        report.key,
+        'done' satisfies FileStatus,
+        report.bytes,
+        report.name,
+      );
+    } else if (report.status === 'failed') {
       this.ctx.storage.sql.exec(
         'UPDATE file SET status = ?, error = ? WHERE name = ?',
         'failed' satisfies FileStatus,
-        errorMessage(err),
-        entry.name,
+        report.error,
+        report.name,
       );
-      await this.broadcastFile(entry.name);
-    } finally {
-      this.inFlight -= 1;
-      this.persistMetrics();
+    } else {
+      this.ctx.storage.sql.exec(
+        'UPDATE file SET status = ? WHERE name = ?',
+        report.status,
+        report.name,
+      );
     }
-  }
-
-  private markFile(name: string, status: FileStatus): void {
-    this.ctx.storage.sql.exec('UPDATE file SET status = ? WHERE name = ?', status, name);
+    this.persistMetrics();
+    await this.broadcastFile(report.name);
   }
 
   private setJobStatus(status: JobStatus): void {
@@ -516,11 +631,17 @@ export class ExtractJob extends DurableObject<JobEnv> {
    * Current derived metrics. Prefers the live in-memory sink (which has the
    * latest counters), falling back to the persisted JSON when the DO was
    * reconstructed after eviction and the sink is fresh.
+   *
+   * The live path also fills in LIVE phase elapsed: while a phase is running its
+   * final `*Ms` hasn't been set yet (that happens when the phase ends), so a mid-
+   * run `report()` would otherwise read `extractionMs: 0` and a too-low
+   * `totalMs`. Here we substitute `now - phaseStart` for the in-progress phase so
+   * the reported timings track reality second-by-second during the run.
    */
   private currentMetrics(persistedJson: string | null): MetricsView {
     const live = this.metrics.snapshot();
     const hasLive = live.rangeRequestCount > 0 || live.filesExtracted > 0 || live.archiveSize > 0;
-    if (hasLive) return deriveMetrics(live);
+    if (hasLive) return deriveMetrics(this.withLiveTimings(live));
     if (persistedJson) {
       try {
         return deriveMetrics(JSON.parse(persistedJson) as RawMetrics);
@@ -529,6 +650,25 @@ export class ExtractJob extends DurableObject<JobEnv> {
       }
     }
     return deriveMetrics(ZERO_METRICS);
+  }
+
+  /**
+   * Overlay live phase-elapsed onto the raw counters for the in-progress phase.
+   * Uses the instance phase-start timestamps (set in `runJob`). A phase whose
+   * final `*Ms` is already recorded is left alone; only the still-running phase
+   * gets `now - start`. Idempotent and pure-ish (reads `performance.now()`).
+   */
+  private withLiveTimings(raw: RawMetrics): RawMetrics {
+    let indexReadMs = raw.indexReadMs;
+    let extractionMs = raw.extractionMs;
+    const now = performance.now();
+    if (raw.phase === 'reading-index' && this.indexStartedAt !== null && indexReadMs === 0) {
+      indexReadMs = now - this.indexStartedAt;
+    }
+    if (raw.phase === 'extracting' && this.extractStartedAt !== null && extractionMs === 0) {
+      extractionMs = now - this.extractStartedAt;
+    }
+    return { ...raw, indexReadMs, extractionMs };
   }
 
   /** Broadcast a JSON message to every connected WebSocket. */
