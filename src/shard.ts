@@ -43,8 +43,8 @@ export interface ShardOptions {
   readonly filesPerWorker: number;
 }
 
-/** Sensible defaults. `maxWorkers × 6` ≈ 144 effective concurrency at the cap. */
-export const DEFAULT_MAX_WORKERS = 24;
+/** Sensible defaults. `maxWorkers × 6` ≈ 384 effective concurrency at the cap. */
+export const DEFAULT_MAX_WORKERS = 64;
 export const DEFAULT_FILES_PER_WORKER = 4;
 
 /**
