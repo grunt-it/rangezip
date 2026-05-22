@@ -38,7 +38,7 @@ export const SAMPLE_PRESETS: readonly SamplePreset[] = [
     label: 'Sample — 2 GB (images · video · docs · text)',
     sizeBytes: 1951670880,
     fileCount: 510,
-    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-2gb.zip',
+    url: 'https://rangezip-samples.grunt.si/sample-2gb.zip',
     available: true,
   },
   {
@@ -46,7 +46,7 @@ export const SAMPLE_PRESETS: readonly SamplePreset[] = [
     label: 'Sample — 10 GB (images · video · docs · text)',
     sizeBytes: 10741815273,
     fileCount: 554,
-    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-10gb.zip',
+    url: 'https://rangezip-samples.grunt.si/sample-10gb.zip',
     available: true,
   },
   {
@@ -54,7 +54,7 @@ export const SAMPLE_PRESETS: readonly SamplePreset[] = [
     label: 'Sample — 30 GB (images · video · docs · text)',
     sizeBytes: 32225498468,
     fileCount: 1663,
-    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-30gb.zip',
+    url: 'https://rangezip-samples.grunt.si/sample-30gb.zip',
     available: true,
   },
 ];
