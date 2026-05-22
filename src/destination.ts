@@ -137,11 +137,12 @@ function awsClient(config: ByoConfig): AwsClient {
  */
 export function makeByoBucket(config: ByoConfig, metrics?: MetricsSink): Layer.Layer<Bucket> {
   const client = awsClient(config);
+  const urlFor = (key: string) => buildObjectUrl(config.endpoint, config.bucket, key);
   return Layer.succeed(Bucket, {
     put: (key, body, size) =>
       Effect.tryPromise({
         try: () =>
-          client.fetch(buildObjectUrl(config.endpoint, config.bucket, key), {
+          client.fetch(urlFor(key), {
             method: 'PUT',
             body,
             headers: { 'Content-Length': String(size) },
@@ -158,7 +159,143 @@ export function makeByoBucket(config: ByoConfig, metrics?: MetricsSink): Layer.L
               ),
         ),
       ),
+
+    // BYO multipart uses the standard S3 multipart API over SigV4 (the same
+    // shape R2's own S3-compatible endpoint speaks). `payload` carries the S3
+    // `uploadId`; each part's `payload` is its returned ETag.
+    createMultipart: (key) =>
+      Effect.tryPromise({
+        try: () => client.fetch(`${urlFor(key)}?uploads`, { method: 'POST' }),
+        catch: (cause) => new R2WriteError(`Failed to start multipart upload for "${key}"`, cause),
+      }).pipe(
+        Effect.flatMap((res) =>
+          res.ok
+            ? Effect.tryPromise({
+                try: async () => {
+                  const uploadId = extractXmlTag(await res.text(), 'UploadId');
+                  if (!uploadId) {
+                    throw new Error('CreateMultipartUpload response had no UploadId');
+                  }
+                  return { key, payload: uploadId };
+                },
+                catch: (cause) =>
+                  new R2WriteError(`Could not parse multipart upload id for "${key}"`, cause),
+              })
+            : Effect.fail(
+                new R2WriteError(
+                  `Destination bucket rejected multipart create for "${key}" (status ${res.status})`,
+                ),
+              ),
+        ),
+      ),
+
+    uploadPart: (handle, partNumber, body, size) =>
+      Effect.tryPromise({
+        try: () =>
+          client.fetch(
+            `${urlFor(handle.key)}?partNumber=${partNumber}&uploadId=${encodeURIComponent(
+              handle.payload as string,
+            )}`,
+            { method: 'PUT', body, headers: { 'Content-Length': String(size) } },
+          ),
+        catch: (cause) =>
+          new R2WriteError(
+            `Failed to upload part ${partNumber} of "${handle.key}" to destination bucket`,
+            cause,
+          ),
+      }).pipe(
+        Effect.flatMap((res) => {
+          const etag = res.headers.get('etag');
+          return res.ok && etag
+            ? Effect.succeed({ partNumber, payload: etag })
+            : Effect.fail(
+                new R2WriteError(
+                  `Destination bucket rejected part ${partNumber} of "${handle.key}" (status ${res.status})`,
+                ),
+              );
+        }),
+      ),
+
+    completeMultipart: (handle, parts, _size) =>
+      Effect.tryPromise({
+        try: () =>
+          client.fetch(
+            `${urlFor(handle.key)}?uploadId=${encodeURIComponent(handle.payload as string)}`,
+            {
+              method: 'POST',
+              body: buildCompleteMultipartXml(parts),
+              headers: { 'Content-Type': 'application/xml' },
+            },
+          ),
+        catch: (cause) =>
+          new R2WriteError(`Failed to complete multipart upload of "${handle.key}"`, cause),
+      }).pipe(
+        Effect.flatMap((res) =>
+          // S3 can return 200 with an error body, so check the body too.
+          res.ok
+            ? Effect.tryPromise({
+                try: async () => {
+                  const text = await res.text();
+                  if (text.includes('<Error>')) {
+                    throw new Error(`CompleteMultipartUpload returned an error body`);
+                  }
+                  metrics?.r2Write();
+                },
+                catch: (cause) =>
+                  new R2WriteError(`Destination bucket failed to complete "${handle.key}"`, cause),
+              })
+            : Effect.fail(
+                new R2WriteError(
+                  `Destination bucket rejected multipart complete for "${handle.key}" (status ${res.status})`,
+                ),
+              ),
+        ),
+      ),
+
+    abortMultipart: (handle) =>
+      Effect.promise(async () => {
+        try {
+          await client.fetch(
+            `${urlFor(handle.key)}?uploadId=${encodeURIComponent(handle.payload as string)}`,
+            { method: 'DELETE' },
+          );
+        } catch {
+          // Best-effort — incomplete S3/R2 multipart uploads are reaped by the
+          // bucket's lifecycle policy if this cleanup doesn't land.
+        }
+      }),
   });
+}
+
+/** Pull the first `<Tag>…</Tag>` text out of an S3 XML response. Pure, regex-based. */
+function extractXmlTag(xml: string, tag: string): string | null {
+  const match = new RegExp(`<${tag}>([^<]+)</${tag}>`).exec(xml);
+  return match ? (match[1] ?? null) : null;
+}
+
+/** Build the `CompleteMultipartUpload` request body from the uploaded parts. */
+function buildCompleteMultipartXml(
+  parts: readonly { partNumber: number; payload: unknown }[],
+): string {
+  const ordered = [...parts].sort((a, b) => a.partNumber - b.partNumber);
+  const body = ordered
+    .map(
+      (p) =>
+        `<Part><PartNumber>${p.partNumber}</PartNumber><ETag>${escapeXml(
+          String(p.payload),
+        )}</ETag></Part>`,
+    )
+    .join('');
+  return `<CompleteMultipartUpload>${body}</CompleteMultipartUpload>`;
+}
+
+/** Minimal XML attribute/text escaping for the ETag values we echo back. */
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // -------------------------------------------------------------------------------------------------

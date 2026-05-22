@@ -17,7 +17,23 @@ import type { AppError } from '../src/effect/errors';
 import { RangeFetchError } from '../src/effect/errors';
 import { Bucket, makeR2Bucket, Source, type ByteRange } from '../src/effect/services';
 import { extractEntry, readIndex } from '../src/extract';
-import { fixtureEntry, makeZipFixture } from './fixtures';
+import { fixtureEntry, makeLargeStoredZipFixture, makeZipFixture } from './fixtures';
+
+const MIB = 1024 * 1024;
+
+/**
+ * Fast byte-array equality for the multi-MiB round-trip checks. Vitest's deep
+ * `toEqual` on a multi-MiB `Uint8Array` is pathologically slow (per-element
+ * structural compare), enough to blow the test timeout — this is a tight loop
+ * that returns a boolean we can assert in O(1).
+ */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
 
 type Services = Source | Bucket;
 
@@ -97,4 +113,54 @@ describe('extractEntry', () => {
     const bytes = new Uint8Array(await stored!.arrayBuffer());
     expect(bytes).toEqual(fixtureEntry(fixture, 'dir/data.json').contents);
   });
+});
+
+describe('extractEntry — large STORED via parallel multipart', () => {
+  const SIZE = 6 * MIB;
+
+  it('round-trips a large STORED entry through the multipart path (bytes match)', async () => {
+    // 6 MiB STORED entry; lowered threshold (4 MiB) + 5 MiB parts ⇒ 2-part plan
+    // (5 MiB + 1 MiB): a real non-last part at R2's 5 MiB floor + a smaller
+    // final part. Fixture kept small on purpose — the workerd test isolate heap
+    // is tight; this still genuinely crosses the 5 MiB part floor.
+    const fixture = makeLargeStoredZipFixture(SIZE);
+    const entries = await run(fixture.bytes, readIndex());
+    const big = entries.find((e) => e.name === 'big.bin')!;
+    expect(big.compressionMethod).toBe(0); // STORED
+
+    const result = await run(
+      fixture.bytes,
+      extractEntry(big, 'mpu-job', undefined, {
+        multipartThreshold: 4 * MIB,
+        partSize: 5 * MIB,
+        partConcurrency: 6,
+      }),
+    );
+    expect(result.key).toBe('mpu-job/big.bin');
+    expect(result.bytesWritten).toBe(SIZE);
+
+    const stored = await env.OUTPUT.get('mpu-job/big.bin');
+    expect(stored).not.toBeNull();
+    expect(stored!.size).toBe(SIZE); // R2 completed the object at the exact size
+    const bytes = new Uint8Array(await stored!.arrayBuffer());
+    expect(bytesEqual(bytes, fixtureEntry(fixture, 'big.bin').contents)).toBe(true);
+  }, 30_000);
+
+  it('the same STORED entry below threshold takes the single-stream path and still matches', async () => {
+    // High threshold ⇒ NOT multipart; verifies the size-gate and that the
+    // single-stream path handles the same STORED entry identically (the bytes
+    // must be identical regardless of which path produced them).
+    const fixture = makeLargeStoredZipFixture(SIZE);
+    const entries = await run(fixture.bytes, readIndex());
+    const big = entries.find((e) => e.name === 'big.bin')!;
+
+    const result = await run(
+      fixture.bytes,
+      extractEntry(big, 'single-path', undefined, { multipartThreshold: 64 * MIB }),
+    );
+    expect(result.bytesWritten).toBe(SIZE);
+    const stored = await env.OUTPUT.get('single-path/big.bin');
+    const bytes = new Uint8Array(await stored!.arrayBuffer());
+    expect(bytesEqual(bytes, fixtureEntry(fixture, 'big.bin').contents)).toBe(true);
+  }, 30_000);
 });

@@ -14,8 +14,8 @@
  */
 
 import { Effect } from 'effect';
-import { DecompressError, ZipParseError } from './effect/errors';
-import { Bucket, Source } from './effect/services';
+import { DecompressError, R2WriteError, ZipParseError } from './effect/errors';
+import { Bucket, Source, type MultipartHandle, type UploadedPart } from './effect/services';
 import type { MetricsSink } from './effect/metrics-sink';
 import {
   ByteReader,
@@ -23,6 +23,8 @@ import {
   computeDataOffset,
   locateCentralDirectory,
   parseCentralDirectory,
+  planMultipartParts,
+  type PartPlan,
   type ZipEntry,
 } from './zip';
 
@@ -33,6 +35,32 @@ const INITIAL_TAIL_BYTES = 64 * 1024;
 const MAX_TAIL_BYTES = 128 * 1024;
 /** Fixed size of a local file header (before its variable name/extra fields). */
 const LOCAL_HEADER_FIXED_BYTES = 30;
+
+/**
+ * STORED entries at or above this size take the parallel multipart path instead
+ * of a single streamed `put`. Below it, a single put is simpler and well within
+ * one invocation's reach. 64 MiB is comfortably above R2's 5 MiB part floor so
+ * even a just-over-threshold entry yields a clean two-part plan.
+ */
+export const DEFAULT_MULTIPART_THRESHOLD = 64 * 1024 * 1024;
+/** Target size of each multipart part. Every part but the last is exactly this. */
+export const DEFAULT_PART_SIZE = 64 * 1024 * 1024;
+/**
+ * Default cap on how many parts of ONE entry upload at once. Mirrors the DO's
+ * per-file concurrency cap so a single large entry's part fan-out doesn't open
+ * more simultaneous range reads than the many-file path already bounds.
+ */
+export const DEFAULT_PART_CONCURRENCY = 6;
+
+/** Tunables for {@link extractEntry}. Injectable so tests can lower the threshold. */
+export interface ExtractOptions {
+  /** STORED entries `>=` this many bytes use the multipart path. */
+  readonly multipartThreshold?: number;
+  /** Part size for the multipart path (every part but the last is exactly this). */
+  readonly partSize?: number;
+  /** Max parts uploaded concurrently for one entry. */
+  readonly partConcurrency?: number;
+}
 
 // -------------------------------------------------------------------------------------------------
 // readIndex — list every entry, no full download
@@ -110,33 +138,35 @@ export interface ExtractedEntry {
   readonly bytesWritten: number;
 }
 
+/** The full error channel of an extraction. */
+type ExtractError =
+  | ZipParseError
+  | DecompressError
+  | import('./effect/errors').RangeFetchError
+  | R2WriteError;
+
 /**
  * Extract a single entry and stream it to `${prefix}/${entry.name}` in R2.
  *
- * Steps:
  *   1. Range-GET the 30-byte local header to compute the true data offset
  *      (the local header's own name/extra lengths differ from the CD's).
- *   2. Range-GET the compressed bytes as a stream.
- *   3. STORED → pass through; DEFLATE → pipe through DecompressionStream.
- *   4. Wrap in a FixedLengthStream sized to the uncompressed length so R2 gets
- *      an exact Content-Length and we assert the produced byte count.
- *   5. R2.put the readable side.
+ *   2. Choose a path:
+ *      - Large STORED entry (`>= multipartThreshold`): split the data range into
+ *        parts, range-GET each in parallel (bounded), and `uploadPart` them into
+ *        an R2 multipart upload, then complete it. No decompression — STORED
+ *        bytes ARE the file, so the range is freely splittable.
+ *      - Everything else (DEFLATE, or small STORED): the single streamed path —
+ *        range-GET → (inflate if DEFLATE) → FixedLengthStream → one `put`. A
+ *        deflate stream isn't randomly seekable, so it can't be split.
  */
 export function extractEntry(
   entry: ZipEntry,
   prefix: string,
   metrics?: MetricsSink,
-): Effect.Effect<
-  ExtractedEntry,
-  | ZipParseError
-  | DecompressError
-  | import('./effect/errors').RangeFetchError
-  | import('./effect/errors').R2WriteError,
-  Source | Bucket
-> {
+  options: ExtractOptions = {},
+): Effect.Effect<ExtractedEntry, ExtractError, Source | Bucket> {
   return Effect.gen(function* () {
     const source = yield* Source;
-    const bucket = yield* Bucket;
 
     // 1. Local header → exact data offset.
     const localHeaderBytes = yield* source.readRange({
@@ -151,22 +181,51 @@ export function extractEntry(
       return yield* Effect.fail(new ZipParseError(offsetResult.reason));
     }
     const dataOffset = offsetResult.dataOffset;
+    const key = joinKey(prefix, entry.name);
 
-    // 2. Compressed bytes as a stream (never fully buffered).
+    const threshold = options.multipartThreshold ?? DEFAULT_MULTIPART_THRESHOLD;
+    const isLargeStored =
+      entry.compressionMethod === CompressionMethod.STORED && entry.uncompressedSize >= threshold;
+
+    if (isLargeStored) {
+      yield* extractStoredMultipart(entry, key, dataOffset, options);
+    } else {
+      yield* extractSingleStream(entry, key, dataOffset, metrics);
+    }
+
+    metrics?.fileExtracted();
+    return { name: entry.name, key, bytesWritten: entry.uncompressedSize };
+  });
+}
+
+/**
+ * The single-stream path: range-GET the (compressed) bytes, inflate if DEFLATE,
+ * size with a FixedLengthStream, and `put` once. Used for DEFLATE entries (a
+ * deflate stream can't be split) and for small STORED entries.
+ */
+function extractSingleStream(
+  entry: ZipEntry,
+  key: string,
+  dataOffset: number,
+  metrics?: MetricsSink,
+): Effect.Effect<void, ExtractError, Source | Bucket> {
+  return Effect.gen(function* () {
+    const source = yield* Source;
+    const bucket = yield* Bucket;
+
     const compressed = yield* source.streamRange({
       start: dataOffset,
       end: dataOffset + entry.compressedSize,
     });
 
-    // 3. Decompress according to method.
     const decompressed =
       entry.compressionMethod === CompressionMethod.DEFLATE
         ? compressed.pipeThrough(new DecompressionStream('deflate-raw'))
         : compressed;
 
-    // 4. FixedLengthStream gives R2 an exact Content-Length and turns a
-    //    truncated/corrupt inflate into a write-time error instead of a silent
-    //    short object.
+    // FixedLengthStream gives R2 an exact Content-Length and turns a
+    // truncated/corrupt inflate into a write-time error instead of a silent
+    // short object.
     const sized = new FixedLengthStream(entry.uncompressedSize);
     const pump = Effect.tryPromise({
       // Measure wallclock around the decompress+stream pump. This is the
@@ -187,16 +246,71 @@ export function extractEntry(
         ),
     });
 
-    const key = joinKey(prefix, entry.name);
-
-    // 5. Run the pump and the R2 write concurrently — the pump feeds the
-    //    writable while R2 drains the readable; they must overlap.
+    // Run the pump and the R2 write concurrently — the pump feeds the writable
+    // while R2 drains the readable; they must overlap.
     yield* Effect.all([pump, bucket.put(key, sized.readable, entry.uncompressedSize)], {
       concurrency: 'unbounded',
     });
+  });
+}
 
-    metrics?.fileExtracted();
-    return { name: entry.name, key, bytesWritten: entry.uncompressedSize };
+/**
+ * The parallel multipart path for a large STORED entry. STORED bytes need no
+ * decompression, so the data range `[dataOffset, dataOffset + size)` splits
+ * cleanly: plan the parts (pure), then range-GET + `uploadPart` each in parallel
+ * with bounded concurrency, and complete the upload. Each part is STREAMED into
+ * its `uploadPart` — never buffered whole. On any failure the upload is aborted.
+ */
+function extractStoredMultipart(
+  entry: ZipEntry,
+  key: string,
+  dataOffset: number,
+  options: ExtractOptions,
+): Effect.Effect<void, ExtractError, Source | Bucket> {
+  return Effect.gen(function* () {
+    const bucket = yield* Bucket;
+
+    const partSize = options.partSize ?? DEFAULT_PART_SIZE;
+    const concurrency = options.partConcurrency ?? DEFAULT_PART_CONCURRENCY;
+
+    // For STORED, compressedSize === uncompressedSize; plan over the real size.
+    const plan = planMultipartParts(dataOffset, entry.uncompressedSize, partSize);
+    if (!plan.ok) {
+      return yield* Effect.fail(
+        new R2WriteError(`Could not plan multipart upload for "${entry.name}": ${plan.reason}`),
+      );
+    }
+
+    const handle = yield* bucket.createMultipart(key);
+
+    // Upload each part in parallel (bounded), aborting the whole upload if any
+    // part fails — then re-fail with the original error.
+    const parts = yield* Effect.all(
+      plan.parts.map((part) => uploadOnePart(handle, part)),
+      {
+        concurrency,
+      },
+    ).pipe(Effect.tapError(() => bucket.abortMultipart(handle)));
+
+    yield* bucket
+      .completeMultipart(handle, parts, entry.uncompressedSize)
+      .pipe(Effect.tapError(() => bucket.abortMultipart(handle)));
+  });
+}
+
+/** Range-GET one planned part and stream it into `uploadPart`. */
+function uploadOnePart(
+  handle: MultipartHandle,
+  part: PartPlan,
+): Effect.Effect<UploadedPart, ExtractError, Source | Bucket> {
+  return Effect.gen(function* () {
+    const source = yield* Source;
+    const bucket = yield* Bucket;
+    const body = yield* source.streamRange({
+      start: part.offset,
+      end: part.offset + part.length,
+    });
+    return yield* bucket.uploadPart(handle, part.partNumber, body, part.length);
   });
 }
 

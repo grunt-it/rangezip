@@ -116,6 +116,26 @@ export function makeHttpSource(sourceUrl: string, metrics?: MetricsSink): Layer.
 // Bucket — R2 output
 // -------------------------------------------------------------------------------------------------
 
+/**
+ * Opaque handle to an in-progress multipart upload. Each `Bucket` backend
+ * stashes whatever it needs (the R2 `R2MultipartUpload` object, or a SigV4
+ * upload-id) in `payload`; the extraction shell only ever passes it back.
+ */
+export interface MultipartHandle {
+  readonly key: string;
+  readonly payload: unknown;
+}
+
+/**
+ * Opaque receipt for one uploaded part. `partNumber` is surfaced so the shell
+ * can sort/sanity-check; `payload` carries the backend-specific completion data
+ * (an `R2UploadedPart`, or an S3 ETag).
+ */
+export interface UploadedPart {
+  readonly partNumber: number;
+  readonly payload: unknown;
+}
+
 export class Bucket extends Context.Tag('Bucket')<
   Bucket,
   {
@@ -129,6 +149,36 @@ export class Bucket extends Context.Tag('Bucket')<
       body: ReadableStream<Uint8Array>,
       size: number,
     ) => Effect.Effect<void, R2WriteError>;
+
+    /**
+     * Begin a multipart upload at `key`. Used for large STORED entries so their
+     * data can be range-fetched and uploaded as parts in parallel (a single
+     * `put` is bound to one invocation's pump). Returns an opaque handle.
+     */
+    readonly createMultipart: (key: string) => Effect.Effect<MultipartHandle, R2WriteError>;
+
+    /**
+     * Upload one part. `body` is the streamed part range (never buffered beyond
+     * what the part API needs); `size` is its exact byte length. Parts may be
+     * uploaded concurrently and out of order — the `partNumber` orders them at
+     * completion, not the call order.
+     */
+    readonly uploadPart: (
+      handle: MultipartHandle,
+      partNumber: number,
+      body: ReadableStream<Uint8Array>,
+      size: number,
+    ) => Effect.Effect<UploadedPart, R2WriteError>;
+
+    /** Finalise the multipart upload from its parts. `size` is the expected total. */
+    readonly completeMultipart: (
+      handle: MultipartHandle,
+      parts: readonly UploadedPart[],
+      size: number,
+    ) => Effect.Effect<void, R2WriteError>;
+
+    /** Best-effort abort of an in-progress multipart upload (cleanup on failure). */
+    readonly abortMultipart: (handle: MultipartHandle) => Effect.Effect<void, never>;
   }
 >() {}
 
@@ -152,5 +202,59 @@ export function makeR2Bucket(binding: R2Bucket, metrics?: MetricsSink): Layer.La
               ),
         ),
       ),
+
+    createMultipart: (key) =>
+      Effect.tryPromise({
+        try: () => binding.createMultipartUpload(key),
+        catch: (cause) => new R2WriteError(`Failed to start multipart upload for "${key}"`, cause),
+      }).pipe(Effect.map((upload) => ({ key, payload: upload }))),
+
+    uploadPart: (handle, partNumber, body, size) =>
+      Effect.tryPromise({
+        try: async () => {
+          const upload = handle.payload as R2MultipartUpload;
+          // Give R2 an exact part length without buffering the whole part: pipe
+          // the part range through a FixedLengthStream sized to `size`, mirroring
+          // the single-`put` path's memory discipline.
+          const sized = new FixedLengthStream(size);
+          const pumped = body.pipeTo(sized.writable);
+          const uploaded = await upload.uploadPart(partNumber, sized.readable);
+          await pumped;
+          return uploaded;
+        },
+        catch: (cause) =>
+          new R2WriteError(`Failed to upload part ${partNumber} of "${handle.key}" to R2`, cause),
+      }).pipe(Effect.map((uploaded) => ({ partNumber, payload: uploaded }))),
+
+    completeMultipart: (handle, parts, size) =>
+      Effect.tryPromise({
+        try: () => {
+          const upload = handle.payload as R2MultipartUpload;
+          const uploaded = parts.map((p) => p.payload as R2UploadedPart);
+          return upload.complete(uploaded);
+        },
+        catch: (cause) =>
+          new R2WriteError(`Failed to complete multipart upload of "${handle.key}"`, cause),
+      }).pipe(
+        Effect.flatMap((object) =>
+          object.size === size
+            ? Effect.sync(() => metrics?.r2Write())
+            : Effect.fail(
+                new R2WriteError(
+                  `R2 completed "${handle.key}" with size ${object.size}, expected ${size}`,
+                ),
+              ),
+        ),
+      ),
+
+    abortMultipart: (handle) =>
+      Effect.promise(async () => {
+        try {
+          await (handle.payload as R2MultipartUpload).abort();
+        } catch {
+          // Best-effort cleanup — the original failure is what matters; R2 also
+          // auto-aborts incomplete uploads after 7 days.
+        }
+      }),
   });
 }
