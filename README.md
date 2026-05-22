@@ -82,6 +82,15 @@ index — not 50 GB.
    buffers the object to discover its size) and turns a truncated or corrupt
    inflate into a clean write-time error instead of a silently short object.
 
+   **Large STORED entries take a parallel path.** A STORED entry above a
+   threshold (64 MiB) needs no decompression, so its byte range splits cleanly:
+   instead of one streamed `put`, rangezip plans the range into parts (each
+   ≥ 5 MiB to satisfy R2), range-GETs the parts **in parallel** with the same
+   bounded concurrency as the per-file pool, streams each into an R2
+   `uploadPart`, then completes the multipart upload. This lifts a single huge
+   STORED file past the limits of one Worker invocation's single-stream pump.
+   DEFLATE entries and small STORED entries keep the single-stream path.
+
 4. **Coordinate with a Durable Object.** One DO per job owns the job's state in
    SQLite, fans the per-file extractions out with bounded concurrency (6 at a
    time), records progress, and isolates per-file failures — one bad entry is
@@ -312,6 +321,43 @@ for that preset in `src/samples.ts` (the demo UI reads the presets from there).
 Until then the preset URLs are documented placeholders (the UI labels them as
 such). Generating/uploading 10–30 GB is a one-time manual step — the script,
 presets, and instructions ship ready; the actual large upload is yours to run.
+
+## Limitations / scope
+
+Being honest about where this technique shines and where it doesn't:
+
+- **Parallelism is across files, not within a compressed file.** The Durable
+  Object fans the per-file extractions out with bounded concurrency (6 at a
+  time), so the sweet spot is **many-file archives** — the more entries, the
+  more the work overlaps. A 10 000-file ZIP parallelises beautifully; a ZIP that
+  is one enormous file does not get the same benefit from the per-file pool.
+
+- **A single large STORED entry IS parallelised.** STORED (uncompressed) data
+  needs no inflate, so its byte range is freely splittable. Above the 64 MiB
+  threshold rangezip range-GETs the parts in parallel and uploads them via an R2
+  multipart upload (see pipeline step 3). This is the common case for the big
+  files inside real archives — large media is usually already-compressed
+  (JPEG/PNG/MP4/…) and therefore stored uncompressed in the ZIP.
+
+- **A single very large DEFLATE entry is the genuine limit.** A raw deflate
+  stream is **not randomly seekable** — byte _N_ of the compressed stream can't
+  be inflated without having inflated everything before it. So a huge DEFLATE
+  entry must inflate **sequentially, in one invocation**, and that one
+  invocation is CPU-bound on the inflate. There is no splitting it; this is a
+  property of DEFLATE, not a missing feature. In practice it's rare: the files
+  big enough to hit this are almost always already-compressed media, which ZIPs
+  store as STORED (the parallel path above), not DEFLATE.
+
+  If you ever genuinely needed to extract a single multi-GB DEFLATE entry that
+  exceeds one invocation's CPU budget, the path is to **offload the sequential
+  inflate to a runtime without the per-invocation CPU limit** — Cloudflare
+  [Workflows](https://developers.cloudflare.com/workflows/) (durable, long-running
+  steps) or [Containers](https://developers.cloudflare.com/containers/) (a full
+  process, no isolate CPU ceiling) — streaming the inflate output into R2 the
+  same way. That's a deliberate non-goal here, called out plainly rather than
+  hidden: this reference targets the memory-bounded, range-driven core, and the
+  STORED-parallel + many-file cases that cover the overwhelming majority of real
+  archives.
 
 ## Why it's built this way — trade-offs
 
