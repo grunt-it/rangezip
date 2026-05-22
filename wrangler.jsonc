@@ -34,4 +34,11 @@
       "bucket_name": "rangezip-output",
     },
   ],
+  "routes": [
+    {
+      "pattern": "rangezip.grunt.si",
+      "custom_domain": true,
+      "zone_name": "grunt.si",
+    },
+  ],
 }
