@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "rangezip-sample-builder",
+  "main": "src/worker.ts",
+  "compatibility_date": "2026-05-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "BUILDER",
+        "class_name": "SampleBuilder",
+      },
+    ],
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["SampleBuilder"],
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "SAMPLES",
+      "bucket_name": "rangezip-samples",
+    },
+  ],
+}

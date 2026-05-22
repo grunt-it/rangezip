@@ -26,11 +26,11 @@ export interface SamplePreset {
   readonly available: boolean;
 }
 
-const GB = 1024 * 1024 * 1024;
-
 /**
- * The presets. Replace `url` with the real public R2 URL after running
- * `bun run scripts/make-sample.ts` and uploading (and flip `available`).
+ * The presets. `sizeBytes` / `fileCount` are the REAL on-disk values measured
+ * after each archive was generated + uploaded to the `rangezip-samples` bucket
+ * (the 2/10/30 GB samples were built server-side on a Cloudflare Worker that
+ * streamed a ZIP64 archive straight into an R2 multipart upload).
  */
 export const SAMPLE_PRESETS: readonly SamplePreset[] = [
   {
@@ -43,19 +43,19 @@ export const SAMPLE_PRESETS: readonly SamplePreset[] = [
   },
   {
     id: 'sample-10gb',
-    label: 'Sample — 10 GB',
-    sizeBytes: 10 * GB,
-    fileCount: 10000,
-    url: 'https://REPLACE-ME.r2.dev/samples/rangezip-sample-10gb.zip',
-    available: false,
+    label: 'Sample — 10 GB (images · video · docs · text)',
+    sizeBytes: 10741815273,
+    fileCount: 554,
+    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-10gb.zip',
+    available: true,
   },
   {
     id: 'sample-30gb',
-    label: 'Sample — 30 GB',
-    sizeBytes: 30 * GB,
-    fileCount: 30000,
-    url: 'https://REPLACE-ME.r2.dev/samples/rangezip-sample-30gb.zip',
-    available: false,
+    label: 'Sample — 30 GB (images · video · docs · text)',
+    sizeBytes: 32225498468,
+    fileCount: 1663,
+    url: 'https://pub-433f90b13bb14e348dee6b9c4b019671.r2.dev/sample-30gb.zip',
+    available: true,
   },
 ];
 
