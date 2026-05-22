@@ -6,7 +6,8 @@
 import { describe, expect, it } from 'vitest';
 import { parseExtractBody } from '../src/app';
 import { joinKey } from '../src/extract';
-import { selectEntries } from '../src/job';
+import { jobPrefix, selectEntries } from '../src/job';
+import type { ByoConfig } from '../src/destination';
 import type { ZipEntry } from '../src/zip';
 import { CompressionMethod } from '../src/zip';
 
@@ -23,7 +24,7 @@ function entry(name: string): ZipEntry {
 
 describe('parseExtractBody', () => {
   it('accepts a valid body with no files (extract-all)', () => {
-    const result = parseExtractBody({ sourceUrl: 'https://example.com/a.zip', prefix: 'out' });
+    const result = parseExtractBody({ sourceUrl: 'https://example.com/a.zip' });
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value.files).toBeUndefined();
   });
@@ -31,25 +32,33 @@ describe('parseExtractBody', () => {
   it('accepts a valid body with a files array', () => {
     const result = parseExtractBody({
       sourceUrl: 'https://example.com/a.zip',
-      prefix: 'out',
       files: ['a.txt', 'b.txt'],
     });
     expect(result.ok).toBe(true);
     if (result.ok) expect(result.value.files).toEqual(['a.txt', 'b.txt']);
   });
 
+  it('ignores a client-supplied prefix (the server derives it from the jobId)', () => {
+    // Back-compat / hardening: even if an old client sends `prefix`, it must be
+    // ignored — the output namespace is server-derived, never client-controlled.
+    const result = parseExtractBody({
+      sourceUrl: 'https://example.com/a.zip',
+      prefix: 'attacker-controlled',
+    } as never);
+    expect(result.ok).toBe(true);
+    if (result.ok) expect('prefix' in result.value).toBe(false);
+  });
+
   it.each([
-    { case: 'missing sourceUrl', body: { prefix: 'out' } },
-    { case: 'non-http url', body: { sourceUrl: 'ftp://example.com/a.zip', prefix: 'out' } },
-    { case: 'missing prefix', body: { sourceUrl: 'https://example.com/a.zip' } },
-    { case: 'empty prefix', body: { sourceUrl: 'https://example.com/a.zip', prefix: '' } },
+    { case: 'missing sourceUrl', body: {} },
+    { case: 'non-http url', body: { sourceUrl: 'ftp://example.com/a.zip' } },
     {
       case: 'non-string files',
-      body: { sourceUrl: 'https://example.com/a.zip', prefix: 'out', files: [1, 2] },
+      body: { sourceUrl: 'https://example.com/a.zip', files: [1, 2] },
     },
     {
       case: 'files not an array',
-      body: { sourceUrl: 'https://example.com/a.zip', prefix: 'out', files: 'a.txt' },
+      body: { sourceUrl: 'https://example.com/a.zip', files: 'a.txt' },
     },
   ])('rejects invalid body: $case', ({ body }) => {
     expect(parseExtractBody(body as never).ok).toBe(false);
@@ -60,7 +69,7 @@ describe('parseExtractBody', () => {
   });
 
   it('defaults destination to demo when omitted', () => {
-    const result = parseExtractBody({ sourceUrl: 'https://x/a.zip', prefix: 'out' });
+    const result = parseExtractBody({ sourceUrl: 'https://x/a.zip' });
     expect(result.ok).toBe(true);
     if (result.ok) {
       expect(result.value.destination).toBe('demo');
@@ -71,7 +80,6 @@ describe('parseExtractBody', () => {
   it('accepts a byo destination with a complete config', () => {
     const result = parseExtractBody({
       sourceUrl: 'https://x/a.zip',
-      prefix: 'out',
       destination: 'byo',
       byo: {
         endpoint: 'https://acct.r2.cloudflarestorage.com',
@@ -91,7 +99,6 @@ describe('parseExtractBody', () => {
   it('rejects a byo destination with a missing config', () => {
     const result = parseExtractBody({
       sourceUrl: 'https://x/a.zip',
-      prefix: 'out',
       destination: 'byo',
     });
     expect(result.ok).toBe(false);
@@ -100,10 +107,52 @@ describe('parseExtractBody', () => {
   it('rejects an unknown destination value', () => {
     const result = parseExtractBody({
       sourceUrl: 'https://x/a.zip',
-      prefix: 'out',
       destination: 'gcs' as never,
     });
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('jobPrefix — multi-user isolation', () => {
+  const byo = (prefix?: string): ByoConfig => ({
+    endpoint: 'https://acct.r2.cloudflarestorage.com',
+    region: 'auto',
+    bucket: 'b',
+    accessKeyId: 'k',
+    secretAccessKey: 's',
+    prefix,
+  });
+
+  it('demo: the prefix IS the jobId', () => {
+    expect(jobPrefix('job-aaaa')).toBe('job-aaaa');
+  });
+
+  it('BYO: folds the jobId UNDER the user in-bucket prefix', () => {
+    expect(jobPrefix('job-aaaa', byo('exports'))).toBe('exports/job-aaaa');
+  });
+
+  it('BYO without an in-bucket prefix falls back to just the jobId', () => {
+    expect(jobPrefix('job-aaaa', byo(undefined))).toBe('job-aaaa');
+    expect(jobPrefix('job-aaaa', byo(''))).toBe('job-aaaa');
+  });
+
+  it('two different jobs NEVER share a key prefix (collision-safe)', () => {
+    // The core correctness guarantee: distinct jobIds ⇒ distinct namespaces, so
+    // job A's output can't overwrite job B's, nor can A's cleanup wipe B's.
+    const a = jobPrefix('job-aaaa');
+    const b = jobPrefix('job-bbbb');
+    expect(a).not.toBe(b);
+    // And neither is a prefix of the other (no `<a>/…` overlapping `<b>/…`).
+    expect(joinKey(a, 'f.txt').startsWith(joinKey(b, ''))).toBe(false);
+    expect(joinKey(b, 'f.txt').startsWith(joinKey(a, ''))).toBe(false);
+  });
+
+  it('two BYO jobs under the SAME in-bucket prefix still never collide', () => {
+    const a = jobPrefix('job-aaaa', byo('shared/exports'));
+    const b = jobPrefix('job-bbbb', byo('shared/exports'));
+    expect(a).toBe('shared/exports/job-aaaa');
+    expect(b).toBe('shared/exports/job-bbbb');
+    expect(a).not.toBe(b);
   });
 });
 

@@ -212,10 +212,8 @@ const PAGE = String.raw`<!doctype html>
     <!-- EXTRACT -->
     <section class="panel">
       <h2>3 — Extract</h2>
-      <div class="row two">
-        <div><label for="prefix">Output prefix (R2 key prefix for this job)</label>
-          <input id="prefix" type="text" value="demo" /></div>
-        <div style="align-self:end"><button id="extractBtn">Extract</button></div>
+      <div class="row">
+        <button id="extractBtn">Extract</button>
       </div>
       <div id="extractErr" class="err hidden"></div>
     </section>
@@ -404,8 +402,9 @@ async function doExtract() {
   $('extractErr').classList.add('hidden');
   const sourceUrl = currentSourceUrl();
   if (!sourceUrl) return showExtractErr('Pick or paste a source ZIP URL first.');
-  const prefix = $('prefix').value.trim() || 'demo';
-  const payload = { sourceUrl, prefix, destination: destMode };
+  // The output prefix is derived server-side from the per-job id (collision-safe
+  // across users); the client no longer sends one.
+  const payload = { sourceUrl, destination: destMode };
   if (destMode === 'byo') payload.byo = byoFromForm();
 
   $('extractBtn').disabled = true;

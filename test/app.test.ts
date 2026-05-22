@@ -136,7 +136,7 @@ describe('gated routes', () => {
       new Request('https://t/extract', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sourceUrl: 'https://x/a.zip', prefix: 'p', destination: 'demo' }),
+        body: JSON.stringify({ sourceUrl: 'https://x/a.zip', destination: 'demo' }),
       }),
       makeEnv(),
     );

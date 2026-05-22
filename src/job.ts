@@ -32,7 +32,7 @@ import { extractEntry, readIndex } from './extract';
 import { makeRuntime, run, type AppRuntime } from './effect/runtime';
 import { MetricsSink } from './effect/metrics-sink';
 import { deriveMetrics, ZERO_METRICS, type MetricsView, type RawMetrics } from './metrics';
-import { makeByoBucket, type ByoConfig } from './destination';
+import { composePrefix, makeByoBucket, type ByoConfig } from './destination';
 import { Layer, ManagedRuntime } from 'effect';
 import { makeHttpSource } from './effect/services';
 import { overallPercent, type ProgressMessage } from './progress';
@@ -87,7 +87,6 @@ export interface JobReport {
 export interface StartInput {
   readonly id: string;
   readonly sourceUrl: string;
-  readonly prefix: string;
   readonly files?: string[];
   readonly destination: Destination;
   readonly byo?: ByoConfig;
@@ -170,6 +169,13 @@ export class ExtractJob extends DurableObject<JobEnv> {
     this.metrics = new MetricsSink();
     this.byoConfig = input.byo ?? null; // transient, in-memory only
 
+    // The output key prefix is derived from the per-job id — never a
+    // user-supplied value — so two jobs can NEVER collide on R2 keys (one job's
+    // output overwriting another's, or one job's cleanup wiping another's). For
+    // BYO we fold the jobId UNDER the user's optional in-bucket prefix, so the
+    // user's bucket layout is preserved while staying per-job isolated.
+    const prefix = jobPrefix(input.id, input.byo);
+
     this.ctx.storage.sql.exec(
       `INSERT OR REPLACE INTO job
          (id, status, source_url, prefix, total, error, destination, expires_at, metrics_json)
@@ -177,12 +183,12 @@ export class ExtractJob extends DurableObject<JobEnv> {
       input.id,
       'pending' satisfies JobStatus,
       input.sourceUrl,
-      input.prefix,
+      prefix,
       input.destination,
     );
 
     // Fire-and-forget: do NOT await. The DO remains active due to pending I/O.
-    void this.runJob(input);
+    void this.runJob(input, prefix);
 
     return { id: input.id, status: 'pending' };
   }
@@ -328,7 +334,7 @@ export class ExtractJob extends DurableObject<JobEnv> {
     return makeRuntime(sourceUrl, this.env.OUTPUT, this.metrics);
   }
 
-  private async runJob(input: StartInput): Promise<void> {
+  private async runJob(input: StartInput, prefix: string): Promise<void> {
     const rt = this.createRuntime(input.sourceUrl);
     const startedAt = Date.now();
     try {
@@ -360,16 +366,17 @@ export class ExtractJob extends DurableObject<JobEnv> {
       this.persistMetrics();
       await this.broadcastSnapshot();
 
-      // Phase 2: extraction (measured wallclock).
+      // Phase 2: extraction (measured wallclock). The prefix is jobId-scoped
+      // (derived in `start`, passed through here) — never a user value.
       const extractStart = performance.now();
-      await this.extractAll(rt, selected, input.prefix);
+      await this.extractAll(rt, selected, prefix);
       this.metrics.setExtractionMs(performance.now() - extractStart);
       this.persistMetrics();
 
       // A job is "completed" even if some files failed — per-file failures are
       // recorded individually and do not fail the whole job.
       this.setJobStatus('completed');
-      await this.scheduleCleanupIfDemo(input.destination, input.prefix);
+      await this.scheduleCleanupIfDemo(input.destination);
 
       // Attribute completion with REAL metrics the run already measured.
       const m = deriveMetrics(this.metrics.snapshot());
@@ -414,8 +421,10 @@ export class ExtractJob extends DurableObject<JobEnv> {
   /**
    * Schedule the cleanup alarm for demo-bucket jobs and record `expiresAt`.
    * BYO jobs return without scheduling anything — their data is never deleted.
+   * `alarm()` reads the jobId-scoped `prefix` column, so cleanup only ever
+   * deletes THIS job's `<jobId>/…` keys — never a shared or another job's prefix.
    */
-  private async scheduleCleanupIfDemo(destination: Destination, _prefix: string): Promise<void> {
+  private async scheduleCleanupIfDemo(destination: Destination): Promise<void> {
     if (destination !== 'demo') return;
     const ttlHours = this.ttlHours();
     const expiresAt = Date.now() + ttlHours * 60 * 60 * 1000;
@@ -589,6 +598,24 @@ export class ExtractJob extends DurableObject<JobEnv> {
 // -------------------------------------------------------------------------------------------------
 // Pure helpers
 // -------------------------------------------------------------------------------------------------
+
+/**
+ * Derive the per-job output key prefix from the job's id. This is the heart of
+ * the multi-user isolation guarantee: every job's output lives under its own
+ * unique `<jobId>/…` namespace, so two jobs can never overwrite each other's
+ * objects, serve each other's downloads, or wipe each other's data on cleanup.
+ *
+ *   - demo bucket: `<jobId>`
+ *   - BYO bucket : `<byoPrefix>/<jobId>` when the user set an in-bucket prefix,
+ *                  else `<jobId>` — the user's bucket layout is preserved, the
+ *                  per-job subfolder makes it collision-safe regardless.
+ *
+ * Pure — no IO. The id is server-generated (`crypto.randomUUID()`), never a
+ * user-supplied value, so it can't be spoofed into another job's namespace.
+ */
+export function jobPrefix(jobId: string, byo?: ByoConfig): string {
+  return composePrefix(byo?.prefix, jobId);
+}
 
 /**
  * Choose which entries to extract. `undefined` selects all; otherwise the named

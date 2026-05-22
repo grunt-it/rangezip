@@ -9,7 +9,7 @@
  *   GET  /healthz                -> liveness
  *
  * Gated (require a valid session cookie — `requireSession` middleware):
- *   POST /extract  { sourceUrl, prefix, files?, destination, byo? }
+ *   POST /extract  { sourceUrl, files?, destination, byo? }
  *                                -> { jobId, status }
  *   POST /validate-destination { destination } -> { valid, reason? }
  *   GET  /jobs/:id               -> JobReport
@@ -65,7 +65,6 @@ const encoder = new TextEncoder();
 
 interface ExtractBody {
   sourceUrl?: unknown;
-  prefix?: unknown;
   files?: unknown;
   destination?: unknown;
   byo?: unknown;
@@ -194,7 +193,7 @@ export function createApp() {
     if (!parsed.ok) {
       return c.json({ error: { tag: 'BadRequest', message: parsed.reason } }, 400);
     }
-    const { sourceUrl, prefix, files, destination, byo } = parsed.value;
+    const { sourceUrl, files, destination, byo } = parsed.value;
 
     // Pre-flight: read the index and validate requested files exist. Cheap —
     // only the tail + central directory are fetched, never the file bodies.
@@ -217,7 +216,6 @@ export function createApp() {
     const { status } = await stub.start({
       id: jobId,
       sourceUrl,
-      prefix,
       files,
       destination,
       byo,
@@ -361,7 +359,6 @@ type ParsedBody =
       ok: true;
       value: {
         sourceUrl: string;
-        prefix: string;
         files?: string[];
         destination: Destination;
         byo?: ByoConfig;
@@ -374,9 +371,6 @@ export function parseExtractBody(body: ExtractBody | null): ParsedBody {
 
   if (typeof body.sourceUrl !== 'string' || !isHttpUrl(body.sourceUrl)) {
     return { ok: false, reason: '"sourceUrl" must be an http(s) URL' };
-  }
-  if (typeof body.prefix !== 'string' || body.prefix.length === 0) {
-    return { ok: false, reason: '"prefix" must be a non-empty string' };
   }
   if (body.files !== undefined) {
     if (!Array.isArray(body.files) || !body.files.every((f) => typeof f === 'string')) {
@@ -406,7 +400,6 @@ export function parseExtractBody(body: ExtractBody | null): ParsedBody {
     ok: true,
     value: {
       sourceUrl: body.sourceUrl,
-      prefix: body.prefix,
       files: body.files as string[] | undefined,
       destination,
       byo,

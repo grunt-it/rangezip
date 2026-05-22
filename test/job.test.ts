@@ -122,18 +122,23 @@ describe('ExtractJob.start', () => {
     const accepted = await stub.start({
       id: 'start-test',
       sourceUrl,
-      prefix: 'out',
       destination: 'demo',
     });
     expect(accepted).toEqual({ id: 'start-test', status: 'pending' });
 
-    // The job row exists immediately after start returns.
+    // The job row exists immediately after start returns, and its stored prefix
+    // is the jobId-scoped namespace (server-derived, never client-supplied).
     await runInDurableObject(stub, async (_instance, state) => {
       const row = state.storage.sql
-        .exec<{ id: string; source_url: string }>('SELECT id, source_url FROM job LIMIT 1')
+        .exec<{
+          id: string;
+          source_url: string;
+          prefix: string;
+        }>('SELECT id, source_url, prefix FROM job LIMIT 1')
         .one();
       expect(row.id).toBe('start-test');
       expect(row.source_url).toBe(sourceUrl);
+      expect(row.prefix).toBe('start-test'); // demo prefix === jobId
     });
 
     // Drain the background promise so the failed fetch settles before the test
@@ -222,6 +227,35 @@ describe('ExtractJob.alarm — demo cleanup', () => {
 
     expect(await env.OUTPUT.get('cleanup-job/one.txt')).toBeNull();
     expect(await env.OUTPUT.get('cleanup-job/nested/two.txt')).toBeNull();
+  });
+
+  it("cleanup is scoped to the job's own jobId prefix — a co-tenant job's output survives", async () => {
+    // Two demo jobs share the bucket but live under DISTINCT jobId prefixes.
+    // Job A's cleanup must wipe ONLY `job-a/…` and leave `job-b/…` untouched —
+    // this is the multi-user collision bug this change fixes.
+    await env.OUTPUT.put('job-a/mine.txt', 'a');
+    await env.OUTPUT.put('job-b/theirs.txt', 'b');
+
+    const stub = env.EXTRACT_JOB.getByName('job-a');
+    await runInDurableObject(stub, async (instance, state) => {
+      seed(
+        state,
+        {
+          id: 'job-a',
+          status: 'completed',
+          sourceUrl: 'https://x/a.zip',
+          prefix: 'job-a', // jobId-scoped prefix
+          destination: 'demo',
+          expiresAt: Date.now(),
+        },
+        [{ name: 'mine.txt', status: 'done', key: 'job-a/mine.txt', bytes: 1 }],
+      );
+      await instance.alarm();
+    });
+
+    expect(await env.OUTPUT.get('job-a/mine.txt')).toBeNull(); // own output gone
+    expect(await env.OUTPUT.get('job-b/theirs.txt')).not.toBeNull(); // co-tenant safe
+    await env.OUTPUT.delete('job-b/theirs.txt'); // cleanup
   });
 
   it('does NOT delete anything for a BYO job', async () => {

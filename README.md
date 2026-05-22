@@ -209,13 +209,14 @@ Labelling honesty notes (a critical reviewer should know these):
 When a **demo-bucket** job completes, the Durable Object schedules an alarm at
 `now + EXTRACT_TTL_HOURS` (default **2h**, set via the `EXTRACT_TTL_HOURS` var in
 `wrangler.jsonc`). The `alarm()` handler deletes **every** R2 object under the
-job's prefix. The job's `expiresAt` drives a live countdown in the UI ("clears
-in 1:58:14"). As a backstop, add an **R2 lifecycle rule** on the output prefix:
+job's own `<jobId>/…` prefix (and only that prefix — never a shared or another
+job's). The job's `expiresAt` drives a live countdown in the UI ("clears in
+1:58:14"). As a backstop, add a bucket-wide **R2 lifecycle rule** (demo output
+keys live at the bucket root under their per-job `<jobId>/` namespace):
 
 ```sh
 # Belt-and-suspenders: even if a DO never fires its alarm, R2 expires the object.
-wrangler r2 bucket lifecycle add rangezip-output \
-  --prefix demo/ --expire-days 1
+wrangler r2 bucket lifecycle add rangezip-output --expire-days 1
 ```
 
 (BYO-bucket jobs are **never** cleaned up — that's the user's data.)
@@ -232,7 +233,6 @@ below require the resulting session cookie (`401` without it).
 ```jsonc
 {
   "sourceUrl": "https://example.com/huge.zip", // must support HTTP range requests
-  "prefix": "exports/job-42", // R2 key prefix for extracted files
   "files": ["docs/report.pdf", "data/rows.csv"], // OPTIONAL — omit to extract all
   "destination": "demo", // "demo" (ephemeral, auto-cleaned) | "byo"
   "byo": {
@@ -242,7 +242,7 @@ below require the resulting session cookie (`401` without it).
     "bucket": "my-bucket",
     "accessKeyId": "…",
     "secretAccessKey": "…",
-    "prefix": "exports/", // optional in-bucket prefix
+    "prefix": "exports/", // optional in-bucket prefix (the user's bucket layout)
   },
 }
 ```
@@ -251,6 +251,15 @@ Returns `202` with `{ "jobId": "...", "status": "pending" }`. The request does a
 cheap pre-flight (reads the index, validates that any explicitly-requested files
 exist → `404` if not) before accepting the job, then returns immediately while
 extraction runs in the background.
+
+**Output keys are scoped per job.** There is **no** caller-supplied output
+prefix — the server derives the R2 key prefix from the per-job id so two
+concurrent jobs can never collide (overwrite each other's objects, serve the
+wrong download, or wipe each other's data on cleanup):
+
+- demo bucket: `<jobId>/<filename>`
+- BYO bucket: `<byoPrefix>/<jobId>/<filename>` (the optional in-bucket `prefix`
+  is the user's bucket layout; the `<jobId>` subfolder keeps it collision-safe).
 
 ### `POST /validate-destination` (gated)
 
@@ -266,10 +275,10 @@ Returns the job status, per-file results, destination/expiry, and live metrics:
 
 ```jsonc
 {
-  "id": "...",
+  "id": "3f9c…", // the jobId; also the demo output key prefix
   "status": "completed", // pending | running | completed | failed
   "sourceUrl": "https://example.com/huge.zip",
-  "prefix": "exports/job-42",
+  "prefix": "3f9c…", // server-derived: <jobId> (demo) or <byoPrefix>/<jobId> (byo)
   "total": 2,
   "done": 2,
   "failed": 0,
@@ -283,7 +292,7 @@ Returns the job status, per-file results, destination/expiry, and live metrics:
   "files": [
     {
       "name": "docs/report.pdf",
-      "key": "exports/job-42/docs/report.pdf",
+      "key": "3f9c…/docs/report.pdf",
       "status": "done",
       "bytes": 1048576,
       "error": null,
