@@ -4,3 +4,5 @@ dist/
 .dev.vars
 *.log
 .DS_Store
+# Generated sample archives (multi-GB) — never commit; see scripts/make-sample.ts
+samples/

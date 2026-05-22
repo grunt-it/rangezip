@@ -25,7 +25,7 @@ form).
 
 This is the most important convention in the repo. Keep them separate.
 
-### Pure logic — `src/zip/`
+### Pure logic — `src/zip/`, plus the other pure modules
 
 All ZIP-format parsing is pure functions over `Uint8Array`: no network, no R2,
 no Effect, no `fetch`. Inputs are bytes (the slices a caller range-GET'd),
@@ -42,6 +42,25 @@ runtime. `test/zip-parse.test.ts` does exactly that.
 
 **When adding ZIP-format handling, it goes in `src/zip/` as a pure function with
 a unit test — not inline in an Effect or the DO.**
+
+The same pure-logic discipline extends to the demo's non-ZIP logic — each pure
+module has a co-located unit test, no runtime needed:
+
+- `src/auth/session.ts` — HMAC-SHA256 session sign/verify, base64url, constant-
+  time compare. Uses only WebCrypto (`crypto.subtle`) + `TextEncoder`, so it's
+  testable without HTTP. `test/auth.test.ts`.
+- `src/auth/codes.ts` — access-code parsing + constant-time matching.
+- `src/metrics.ts` — the metrics aggregation/labelling math (totals, the
+  headline percentage, bytes-saved). `test/metrics.test.ts`.
+- `src/progress.ts` — WebSocket message types + `overallPercent`.
+  `test/progress.test.ts`.
+- `src/destination.ts` (pure half) — BYO config validation, object-URL building,
+  prefix composition. `test/destination.test.ts`.
+- `src/samples.ts` — sample-preset data.
+
+The shells that wrap these (`src/auth/middleware.ts` Hono middleware,
+`src/destination.ts` SigV4 `Bucket` + validate, `src/effect/metrics-sink.ts` the
+mutable collector) are thin and sit on top.
 
 ### Effect shell — `src/effect/`, `src/extract.ts`
 
@@ -84,7 +103,10 @@ and the central directory, stop — use `streamRange` and keep it a stream.
 ## Durable Object — `src/job.ts`
 
 - One DO per job (`getByName(jobId)`). SQLite schema created in the constructor
-  via `blockConcurrencyWhile` (init only — never hold it across IO).
+  via `blockConcurrencyWhile` (init only — never hold it across IO). New columns
+  (`destination`, `expires_at`, `metrics_json`) are part of the same
+  `CREATE TABLE IF NOT EXISTS` — no new DO migration tag was needed (the v1
+  migration already covers the SQLite class; column adds happen in `migrate()`).
 - `start()` records the job and fires `runJob` **fire-and-forget** (`void`, not
   awaited) so it returns the jobId immediately; the DO stays alive on pending
   I/O. `waitUntil` is a no-op in DOs.
@@ -92,6 +114,31 @@ and the central directory, stop — use `streamRange` and keep it a stream.
   continues. The job only `failed`s if extraction couldn't start.
 - `createRuntime(sourceUrl)` is a `protected` seam so tests can subclass and
   inject an in-memory `Source`. Don't add test-only branching to the hot path.
+  It picks the demo R2 `Bucket` or a SigV4 BYO `Bucket` based on `byoConfig`.
+- **WebSockets via the Hibernation API.** `fetch()` accepts the upgrade with
+  `ctx.acceptWebSocket(server)` and returns `new Response(null, { status: 101,
+webSocket: client })`. Progress is broadcast to `ctx.getWebSockets()`. The
+  Worker (`app.ts` `GET /jobs/:id/ws`) checks the session + upgrade header, then
+  `stub.fetch(c.req.raw)` forwards the upgrade. Don't use a non-hibernatable
+  `server.accept()` here — hibernation lets the DO be evicted between bursts.
+- **Cleanup via one alarm.** A completed _demo_ job calls `setAlarm(now + ttl)`;
+  `alarm()` deletes every R2 object under the prefix and is a **no-op for BYO**
+  jobs (never delete the user's data). `setAlarm` replaces any existing alarm —
+  one per DO.
+- **Metrics + BYO creds in memory.** The live `MetricsSink` and the transient
+  `byoConfig` are in-memory instance fields. `byoConfig` (the access key/secret)
+  is NEVER written to SQLite, logged, or returned — it's dropped in `runJob`'s
+  `finally`. Metrics are persisted to `metrics_json` so `report()` survives
+  eviction; `currentMetrics()` prefers the live sink, falls back to the column.
+
+## Metrics honesty
+
+Every metric is a real measurement (see README "Honest metrics"). When touching
+metrics, keep the labels honest: `computeMs` is **measured wallclock** around the
+inflate pump (label says "measured", never "billed CPU-ms"); the headline % can
+exceed 100% on extract-all of a small archive (that's correct, not a bug);
+`centralDirectoryReads` is a genuine read-once-reuse count. Don't invent or
+mislabel a number to make the demo look better.
 
 ## Testing notes
 

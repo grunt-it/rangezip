@@ -11,6 +11,12 @@
 interface RangezipEnv {
   OUTPUT: R2Bucket;
   EXTRACT_JOB: DurableObjectNamespace<import('./src/worker').ExtractJob>;
+  /** Comma-separated list of multi-use access codes (secret). */
+  ACCESS_CODES?: string;
+  /** HMAC key for signing session cookies (secret). */
+  SESSION_SECRET?: string;
+  /** Demo-bucket cleanup TTL in hours (var, default 2). */
+  EXTRACT_TTL_HOURS?: string;
 }
 
 declare namespace Cloudflare {

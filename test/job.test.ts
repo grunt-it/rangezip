@@ -19,7 +19,14 @@ import { describe, expect, it, vi } from 'vitest';
 /** Seed the job + file rows directly in the DO's SQLite. */
 function seed(
   state: DurableObjectState,
-  job: { id: string; status: string; sourceUrl: string; prefix: string },
+  job: {
+    id: string;
+    status: string;
+    sourceUrl: string;
+    prefix: string;
+    destination?: string;
+    expiresAt?: number;
+  },
   files: ReadonlyArray<{
     name: string;
     status: string;
@@ -29,12 +36,16 @@ function seed(
   }>,
 ): void {
   state.storage.sql.exec(
-    'INSERT OR REPLACE INTO job (id, status, source_url, prefix, total, error) VALUES (?, ?, ?, ?, ?, NULL)',
+    `INSERT OR REPLACE INTO job
+       (id, status, source_url, prefix, total, error, destination, expires_at, metrics_json)
+     VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL)`,
     job.id,
     job.status,
     job.sourceUrl,
     job.prefix,
     files.length,
+    job.destination ?? 'demo',
+    job.expiresAt ?? null,
   );
   for (const f of files) {
     state.storage.sql.exec(
@@ -108,7 +119,12 @@ describe('ExtractJob.start', () => {
     // and records a job-level failure — but `start` itself returns immediately
     // with a pending job (it must not block on the extraction).
     const sourceUrl = 'http://127.0.0.1:1/archive.zip';
-    const accepted = await stub.start({ id: 'start-test', sourceUrl, prefix: 'out' });
+    const accepted = await stub.start({
+      id: 'start-test',
+      sourceUrl,
+      prefix: 'out',
+      destination: 'demo',
+    });
     expect(accepted).toEqual({ id: 'start-test', status: 'pending' });
 
     // The job row exists immediately after start returns.
@@ -131,5 +147,104 @@ describe('ExtractJob.start', () => {
       },
       { timeout: 5000, interval: 25 },
     );
+  });
+});
+
+describe('ExtractJob.report — new fields', () => {
+  it('exposes destination, expiresAt, percent, and metrics defaults', async () => {
+    const stub = env.EXTRACT_JOB.getByName('report-fields');
+    const future = Date.now() + 3_600_000;
+    await runInDurableObject(stub, async (_instance, state) => {
+      seed(
+        state,
+        {
+          id: 'report-fields',
+          status: 'completed',
+          sourceUrl: 'https://x/a.zip',
+          prefix: 'out',
+          destination: 'demo',
+          expiresAt: future,
+        },
+        [
+          { name: 'a.txt', status: 'done', key: 'out/a.txt', bytes: 10 },
+          { name: 'b.txt', status: 'failed', error: 'boom' },
+        ],
+      );
+    });
+    const report = await stub.report();
+    expect(report!.destination).toBe('demo');
+    expect(report!.expiresAt).toBe(future);
+    expect(report!.percent).toBe(100); // 1 done + 1 failed of 2 = settled
+    expect(report!.metrics).toBeDefined();
+    expect(report!.metrics.rangeBytesPercent).toBe(0); // no metrics recorded yet
+  });
+});
+
+describe('ExtractJob.fetch — WebSocket upgrade', () => {
+  // NOTE: The 101-with-webSocket success path can't be asserted through
+  // `runInDurableObject` — the pool's transport re-validates the returned
+  // Response against the (non-upgrade) outer request and rejects a WebSocket
+  // body. This is the documented "WebSockets + DO + per-file isolation" pool
+  // limitation. We assert the testable non-upgrade contract here; the live
+  // upgrade is exercised by the app-level gating tests + manual `wrangler dev`.
+  it('rejects a non-upgrade request with 426', async () => {
+    const stub = env.EXTRACT_JOB.getByName('ws-noupgrade');
+    const res = await runInDurableObject(stub, (instance) =>
+      instance.fetch(new Request('https://do/jobs/ws-noupgrade/ws')),
+    );
+    expect(res.status).toBe(426);
+  });
+});
+
+describe('ExtractJob.alarm — demo cleanup', () => {
+  it('deletes every R2 object under the job prefix for a demo job', async () => {
+    // Put real objects under the prefix in the test R2 bucket.
+    await env.OUTPUT.put('cleanup-job/one.txt', 'hello');
+    await env.OUTPUT.put('cleanup-job/nested/two.txt', 'world');
+    expect(await env.OUTPUT.get('cleanup-job/one.txt')).not.toBeNull();
+
+    const stub = env.EXTRACT_JOB.getByName('cleanup-job');
+    await runInDurableObject(stub, async (instance, state) => {
+      seed(
+        state,
+        {
+          id: 'cleanup-job',
+          status: 'completed',
+          sourceUrl: 'https://x/a.zip',
+          prefix: 'cleanup-job',
+          destination: 'demo',
+          expiresAt: Date.now(),
+        },
+        [{ name: 'one.txt', status: 'done', key: 'cleanup-job/one.txt', bytes: 5 }],
+      );
+      await instance.alarm();
+    });
+
+    expect(await env.OUTPUT.get('cleanup-job/one.txt')).toBeNull();
+    expect(await env.OUTPUT.get('cleanup-job/nested/two.txt')).toBeNull();
+  });
+
+  it('does NOT delete anything for a BYO job', async () => {
+    await env.OUTPUT.put('byo-job/keep.txt', 'precious');
+    const stub = env.EXTRACT_JOB.getByName('byo-job');
+    await runInDurableObject(stub, async (instance, state) => {
+      seed(
+        state,
+        {
+          id: 'byo-job',
+          status: 'completed',
+          sourceUrl: 'https://x/a.zip',
+          prefix: 'byo-job',
+          destination: 'byo',
+        },
+        [{ name: 'keep.txt', status: 'done', key: 'byo-job/keep.txt', bytes: 8 }],
+      );
+      await instance.alarm();
+    });
+    // BYO alarm is a no-op; the demo bucket object (used here as a stand-in)
+    // must remain untouched — the cleanup only runs for demo-destination jobs.
+    expect(await env.OUTPUT.get('byo-job/keep.txt')).not.toBeNull();
+    // cleanup so the bucket isn't polluted for other tests
+    await env.OUTPUT.delete('byo-job/keep.txt');
   });
 });

@@ -18,13 +18,22 @@
 import { Cause, Effect, Exit, Layer, ManagedRuntime } from 'effect';
 import { isTaggedError, type AppError } from './errors';
 import { Bucket, makeHttpSource, makeR2Bucket, Source } from './services';
+import type { MetricsSink } from './metrics-sink';
 
 export type Services = Source | Bucket;
 export type AppRuntime = ManagedRuntime.ManagedRuntime<Services, never>;
 
-/** Build a runtime bound to one source URL and one R2 bucket. */
-export function makeRuntime(sourceUrl: string, bucket: R2Bucket): AppRuntime {
-  const layer = Layer.mergeAll(makeHttpSource(sourceUrl), makeR2Bucket(bucket));
+/**
+ * Build a runtime bound to one source URL and one R2 bucket. An optional
+ * `MetricsSink` is threaded into both services so range-GETs and R2 writes are
+ * recorded as they happen (the Worker pre-flight omits it; the DO supplies one).
+ */
+export function makeRuntime(
+  sourceUrl: string,
+  bucket: R2Bucket,
+  metrics?: MetricsSink,
+): AppRuntime {
+  const layer = Layer.mergeAll(makeHttpSource(sourceUrl, metrics), makeR2Bucket(bucket, metrics));
   return ManagedRuntime.make(layer);
 }
 

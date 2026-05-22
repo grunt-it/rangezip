@@ -8,6 +8,12 @@
   "observability": {
     "enabled": true,
   },
+  // Non-secret vars. Secrets (ACCESS_CODES, SESSION_SECRET) are set out-of-band
+  // via `wrangler secret put` — never committed here. See README "Auth setup".
+  "vars": {
+    // Demo-bucket output is auto-deleted this many hours after a job completes.
+    "EXTRACT_TTL_HOURS": "2",
+  },
   "durable_objects": {
     "bindings": [
       {

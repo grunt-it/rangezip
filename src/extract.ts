@@ -16,6 +16,7 @@
 import { Effect } from 'effect';
 import { DecompressError, ZipParseError } from './effect/errors';
 import { Bucket, Source } from './effect/services';
+import type { MetricsSink } from './effect/metrics-sink';
 import {
   ByteReader,
   CompressionMethod,
@@ -41,7 +42,9 @@ const LOCAL_HEADER_FIXED_BYTES = 30;
  * Read and parse the central directory, returning every entry. Grows the tail
  * read once if the EOCD/ZIP64 records don't fit in the initial window.
  */
-export function readIndex(): Effect.Effect<
+export function readIndex(
+  metrics?: MetricsSink,
+): Effect.Effect<
   readonly ZipEntry[],
   ZipParseError | import('./effect/errors').RangeFetchError,
   Source
@@ -56,6 +59,9 @@ export function readIndex(): Effect.Effect<
       start: location.offset,
       end: location.offset + location.size,
     });
+    // The central directory is read exactly ONCE here, then reused for every
+    // file extraction in the job — a real reuse metric, not an invented one.
+    metrics?.centralDirectoryRead();
 
     const parsed = parseCentralDirectory(cdBytes, location.entryCount);
     if (!parsed.ok) {
@@ -119,6 +125,7 @@ export interface ExtractedEntry {
 export function extractEntry(
   entry: ZipEntry,
   prefix: string,
+  metrics?: MetricsSink,
 ): Effect.Effect<
   ExtractedEntry,
   | ZipParseError
@@ -162,7 +169,17 @@ export function extractEntry(
     //    short object.
     const sized = new FixedLengthStream(entry.uncompressedSize);
     const pump = Effect.tryPromise({
-      try: () => decompressed.pipeTo(sized.writable),
+      // Measure wallclock around the decompress+stream pump. This is the
+      // CPU-bound inflate section (plus the stream plumbing) — recorded as a
+      // MEASURED time delta, never represented as billed CPU-ms.
+      try: async () => {
+        const startedAt = performance.now();
+        try {
+          return await decompressed.pipeTo(sized.writable);
+        } finally {
+          metrics?.compute(performance.now() - startedAt);
+        }
+      },
       catch: (cause) =>
         new DecompressError(
           `Failed to decompress/stream "${entry.name}" (method ${entry.compressionMethod})`,
@@ -178,6 +195,7 @@ export function extractEntry(
       concurrency: 'unbounded',
     });
 
+    metrics?.fileExtracted();
     return { name: entry.name, key, bytesWritten: entry.uncompressedSize };
   });
 }

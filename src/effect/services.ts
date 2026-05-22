@@ -11,6 +11,7 @@
 
 import { Context, Effect, Layer } from 'effect';
 import { R2WriteError, RangeFetchError } from './errors';
+import type { MetricsSink } from './metrics-sink';
 
 // -------------------------------------------------------------------------------------------------
 // Source — range reads over the remote archive
@@ -43,8 +44,12 @@ export class Source extends Context.Tag('Source')<
  * HTTP-backed `Source`. Issues `Range: bytes=start-end` requests and discovers
  * the total size from the `Content-Range` header of a 1-byte probe (more
  * reliable than HEAD, which some object stores answer without a length).
+ *
+ * If a `MetricsSink` is provided, every range-GET and the size probe are
+ * recorded with their REAL byte spans, so the headline "bytes fetched" metric
+ * reflects bytes actually pulled over the wire.
  */
-export function makeHttpSource(sourceUrl: string): Layer.Layer<Source> {
+export function makeHttpSource(sourceUrl: string, metrics?: MetricsSink): Layer.Layer<Source> {
   const fetchRange = (range: ByteRange) =>
     Effect.tryPromise({
       try: () =>
@@ -61,6 +66,7 @@ export function makeHttpSource(sourceUrl: string): Layer.Layer<Source> {
             `Source did not honour the byte-range request (status ${res.status}); the URL must support HTTP range requests`,
           ),
       ),
+      Effect.tap(() => Effect.sync(() => metrics?.range(range.start, range.end))),
     );
 
   return Layer.succeed(Source, {
@@ -79,6 +85,9 @@ export function makeHttpSource(sourceUrl: string): Layer.Layer<Source> {
           ),
         );
       }
+      // The probe IS a 1-byte range request — count it honestly.
+      metrics?.range(0, 1);
+      metrics?.setArchiveSize(Number(total));
       return Number(total);
     }),
 
@@ -123,8 +132,8 @@ export class Bucket extends Context.Tag('Bucket')<
   }
 >() {}
 
-/** R2-binding-backed `Bucket`. */
-export function makeR2Bucket(binding: R2Bucket): Layer.Layer<Bucket> {
+/** R2-binding-backed `Bucket`. Records each successful write to the sink. */
+export function makeR2Bucket(binding: R2Bucket, metrics?: MetricsSink): Layer.Layer<Bucket> {
   return Layer.succeed(Bucket, {
     put: (key, body, size) =>
       Effect.tryPromise({
@@ -135,7 +144,7 @@ export function makeR2Bucket(binding: R2Bucket): Layer.Layer<Bucket> {
       }).pipe(
         Effect.flatMap((object) =>
           object && object.size === size
-            ? Effect.void
+            ? Effect.sync(() => metrics?.r2Write())
             : Effect.fail(
                 new R2WriteError(
                   `R2 wrote "${key}" with size ${object?.size ?? 'unknown'}, expected ${size}`,

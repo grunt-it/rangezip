@@ -58,6 +58,53 @@ describe('parseExtractBody', () => {
   it('rejects a null body', () => {
     expect(parseExtractBody(null).ok).toBe(false);
   });
+
+  it('defaults destination to demo when omitted', () => {
+    const result = parseExtractBody({ sourceUrl: 'https://x/a.zip', prefix: 'out' });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.destination).toBe('demo');
+      expect(result.value.byo).toBeUndefined();
+    }
+  });
+
+  it('accepts a byo destination with a complete config', () => {
+    const result = parseExtractBody({
+      sourceUrl: 'https://x/a.zip',
+      prefix: 'out',
+      destination: 'byo',
+      byo: {
+        endpoint: 'https://acct.r2.cloudflarestorage.com',
+        region: 'auto',
+        bucket: 'b',
+        accessKeyId: 'k',
+        secretAccessKey: 's',
+      },
+    });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.destination).toBe('byo');
+      expect(result.value.byo?.bucket).toBe('b');
+    }
+  });
+
+  it('rejects a byo destination with a missing config', () => {
+    const result = parseExtractBody({
+      sourceUrl: 'https://x/a.zip',
+      prefix: 'out',
+      destination: 'byo',
+    });
+    expect(result.ok).toBe(false);
+  });
+
+  it('rejects an unknown destination value', () => {
+    const result = parseExtractBody({
+      sourceUrl: 'https://x/a.zip',
+      prefix: 'out',
+      destination: 'gcs' as never,
+    });
+    expect(result.ok).toBe(false);
+  });
 });
 
 describe('joinKey', () => {
