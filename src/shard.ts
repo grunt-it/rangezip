@@ -43,7 +43,10 @@ export interface ShardOptions {
   readonly filesPerWorker: number;
 }
 
-/** Sensible defaults. `maxWorkers × 6` ≈ 384 effective concurrency at the cap. */
+/** Sensible defaults. `maxWorkers × 6` ≈ 384 effective concurrency at the cap.
+ * 64 is the sweet spot: beyond it, typical archives (~500 files) starve each
+ * worker's 6-connection pool (too few files/worker), so aggregate concurrency
+ * DROPS and spawn overhead grows — measured 768-way as slower than 384-way. */
 export const DEFAULT_MAX_WORKERS = 64;
 export const DEFAULT_FILES_PER_WORKER = 4;
 
