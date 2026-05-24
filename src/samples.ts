@@ -28,9 +28,15 @@ export interface SamplePreset {
 
 /**
  * The presets. `sizeBytes` / `fileCount` are the REAL on-disk values measured
- * after each archive was generated + uploaded to the `rangezip-samples` bucket
- * (the 2/10/30 GB samples were built server-side on a Cloudflare Worker that
- * streamed a ZIP64 archive straight into an R2 multipart upload).
+ * after each archive was built + uploaded to the `rangezip-samples` bucket.
+ * The 2 GB sample holds 510 genuinely-distinct real files (ImageMagick plasma
+ * images, ffmpeg MP4s, pdf-lib PDFs, real text/markdown/csv/json). The 10 GB
+ * and 30 GB samples are built by CYCLING through the 2 GB sample's entries and
+ * copying each entry's data VERBATIM into a new ZIP64 entry (unique renumbered
+ * name, same method/sizes/CRC) — so every extracted file is a real, intact,
+ * openable file, not synthetic filler, including entries well past the 4 GB
+ * ZIP64 boundary. Each archive is verified before upload by re-parsing it with
+ * this repo's own `src/zip` reader (CRC match + file-signature check).
  */
 export const SAMPLE_PRESETS: readonly SamplePreset[] = [
   {
@@ -44,16 +50,16 @@ export const SAMPLE_PRESETS: readonly SamplePreset[] = [
   {
     id: 'sample-10gb',
     label: 'Sample — 10 GB (images · video · docs · text)',
-    sizeBytes: 10741815273,
-    fileCount: 554,
+    sizeBytes: 10743662171,
+    fileCount: 2600,
     url: 'https://rangezip-samples.grunt.si/sample-10gb.zip',
     available: true,
   },
   {
     id: 'sample-30gb',
     label: 'Sample — 30 GB (images · video · docs · text)',
-    sizeBytes: 32225498468,
-    fileCount: 1663,
+    sizeBytes: 32232826635,
+    fileCount: 8211,
     url: 'https://rangezip-samples.grunt.si/sample-30gb.zip',
     available: true,
   },
