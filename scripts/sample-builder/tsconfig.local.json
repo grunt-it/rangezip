@@ -1,0 +1,21 @@
+{
+  // The LOCAL (bun/node) scripts — build-local.ts + the disk/remote verifiers —
+  // run under `bun`, not in workerd, so they get node + DOM-stream types instead
+  // of @cloudflare/workers-types. Kept separate from the Workers tsconfig so the
+  // `worker.ts` / DO typecheck stays Workers-targeted.
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM"],
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true
+  },
+  "include": ["build-local.ts", "verify-disk.ts"]
+}
