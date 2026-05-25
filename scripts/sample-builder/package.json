@@ -6,11 +6,12 @@
   "description": "TEMPORARY Cloudflare Worker that generates + uploads the 10/30 GB rangezip ZIP64 samples entirely server-side (DO -> R2 multipart). Undeploy with `wrangler delete` after the uploads; the script stays in the repo for reproducibility.",
   "scripts": {
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.local.json",
     "delete": "wrangler delete"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260522.1",
+    "@types/node": "^25.9.1",
     "typescript": "^6.0.3",
     "wrangler": "^4.94.0"
   }
